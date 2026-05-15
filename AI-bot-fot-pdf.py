@@ -1,0 +1,545 @@
+import streamlit as st
+from ollama import chat
+from pypdf import PdfReader
+from PyPDF2 import PdfReader
+import ollama
+from datasets import load_dataset
+import pandas as pd
+import PyPDF2
+import re
+from langchain_core.documents import Document
+# 1. 頁面配置
+st.set_page_config(page_title="AI Assistant", layout="wide")
+
+# 2. CSS 注入：優化對話框氣泡與佈局
+st.markdown("""
+    <style>
+    /* 1. 隱藏最外層的 Radio 標題 (選單兩個字) */
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] {
+        display: none;
+    }
+
+    /* 2. 針對 Radio 選項的容器進行排版 */
+    div[data-testid="stRadio"] > div {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    /* 3. 重要：隱藏圓圈圖示，但不影響文字內容 */
+    /* 我們精確鎖定那個裝圓圈的 div 並將其寬度設為 0 */
+    div[data-testid="stRadio"] label div[role="presentation"] {
+        display: none !important;
+    }
+
+    /* 4. 設定選單按鈕的外觀 */
+    div[data-testid="stRadio"] label {
+        background-color: transparent !important;
+        border-radius: 8px !important;
+        padding: 10px 16px !important;
+        margin: 0px !important;
+        color: #E0E0E0 !important; /* 未選中時的文字顏色 */
+        cursor: pointer;
+        border: none !important;
+        transition: 0.2s;
+        width: 100% !important;
+    }
+
+    /* 5. 滑鼠懸停效果 */
+    div[data-testid="stRadio"] label:hover {
+        background-color: rgba(255, 255, 255, 0.05) !important;
+    }
+
+    /* 6. 選中狀態的藍色背景 (模仿截圖中的深藍色) */
+    div[data-testid="stRadio"] label:has(input:checked) {
+        background-color: #1E3A8A !important; /* 深藍色背景 */
+        color: white !important; /* 選中時文字變亮白 */
+    }
+
+    /* 7. 強制顯示文字內容，防止被之前的規則誤殺 */
+    div[data-testid="stRadio"] label div[data-testid="stMarkdownContainer"] p {
+        font-size: 14px !important;
+        margin: 0 !important;
+        opacity: 1 !important;
+        display: block !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# 3. 初始化 Session State (跨頁面共享資料)
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if 'manual_context' not in st.session_state:
+    st.session_state['manual_context'] = ""
+if 'temp_text' not in st.session_state:
+    st.session_state['temp_text'] = ""
+
+
+
+# 4. 側邊欄導覽選單
+with st.sidebar:
+    st.markdown('<p class="sidebar-header">對話</p>', unsafe_allow_html=True)
+    
+    # 這裡就是你的選單選項，對應圖片中的文字
+    menu_options = [
+        "手冊解析與校對", 
+        "正式資料庫管理",
+        "AI對話機器人"
+    ]
+    
+    # 使用 radio 但透過 CSS 隱藏圓圈
+    page_selection = st.radio(
+        "選單", # 標籤會被 CSS 隱藏
+        options=menu_options,
+        index=0
+    )
+    
+    # 邏輯判斷：根據文字內容決定目前頁面
+    if "手冊解析與校對" in page_selection:
+        page = "手冊解析與校對"
+    elif "正式資料庫管理" in page_selection:
+        page = "正式資料庫管理"
+    else:
+        page = "AI對話機器人"
+
+    st.divider()
+
+    st.header("⚙️ 模型配置")
+    
+    try:
+        # 1. 抓取模型資訊
+        response = ollama.list()
+        
+        # 2. 針對看到的欄位進行提取
+        available_models = [m.model for m in response.models]
+        
+        if available_models:
+            # 3. 建立下拉選單
+            default_model = "ycchen/breeze-7b-instruct-v1_0:latest" if "ycchen/breeze-7b-instruct-v1_0:latest" in available_models else available_models[0]
+            
+            target_model = st.selectbox(
+                "請選擇 Ollama 模型",
+                options=available_models,
+                index=available_models.index(default_model)
+            )
+            st.success(f"✅ 已偵測到 {len(available_models)} 個模型")
+        else:
+            st.warning("找不到模型，請確認 ollama list 是否有內容")
+            target_model = st.text_input("手動輸入模型", value="qwen2.5")
+            
+    except Exception as e:
+        st.error(f"連線失敗：{e}")
+        target_model = st.text_input("手動輸入模型", value="qwen2.5")
+
+   
+
+    st.subheader("⚙️ 檢索權重配置")
+    # 新增 K 值調整條，範圍 1 到 20，預設值為 5
+    retrieval_k = st.slider("檢索片段數量 (K)", min_value=1, max_value=30, value=5, help="數值愈小愈精確，愈大則參考資料愈多。")
+    
+    # 將數值存入 session_state 以便函式讀取
+    st.session_state['dynamic_k'] = retrieval_k
+
+
+    st.header("🧹 系統維護")
+    if st.button("🗑️ 清除快取紀錄"):
+        # 1. 清除 Streamlit 的內部緩存 (例如 load_dataset 的結果)
+        st.cache_data.clear()
+        
+        # 2. 清除所有 Session State (包含對話紀錄、手冊文本、註解)
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+            
+        # 3. 顯示成功訊息並重新整頁
+        st.toast("快取已完全清除！")
+        st.rerun()
+@st.cache_data
+def get_test_dataset():
+    # 載入 MediaTek 的繁體中文閱讀理解資料集
+    dataset = load_dataset("MediaTek-Research/TCEval-v2", "drcd", split='test')
+    return pd.DataFrame(dataset)
+
+def clean_duplicated_text(text):
+    if not text:
+        return ""
+    
+    # 0. 強力過濾 PDF 常見的特殊空白
+    text = text.replace('\xa0', ' ').replace('\u3000', ' ')
+        
+    # 1. 縮減連續多個空白為單一空白
+    text = re.sub(r'\s+', ' ', text)
+
+    # 2. 處理「中文字」單個重複 (例如：總總 -> 總)
+    # 使用 [ \u4e00-\u9fa5] 鎖定中文字
+    text = re.sub(r'([\u4e00-\u9fa5])\1+', r'\1', text)
+
+    # 3. 處理「中文字組」重複 (例如：第一章第一章 -> 第一章)
+    for _ in range(3):
+        # 模式 A: 字組連在一起 (第一章第一章)
+        text = re.sub(r'([\u4e00-\u9fa5]{2,10})\1', r'\1', text)
+        # 模式 B: 字組中間夾一個空白 (第一章 第一章)
+        text = re.sub(r'([\u4e00-\u9fa5]{2,10})\s\1', r'\1', text)
+
+    # 4. 處理中文單字中間夾空白的重複 (例如：總 總 -> 總)
+    text = re.sub(r'([\u4e00-\u9fa5])\s\1', r'\1', text)
+
+    return text.strip()
+
+
+# --- 1. 定義 Embedding 模型 (RAG 的靈魂) ---
+@st.cache_resource
+def get_embedding_model():
+    # 使用多國語言預訓練模型，適合處理繁體中文手冊
+    from langchain_huggingface import HuggingFaceEmbeddings
+    model_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    return HuggingFaceEmbeddings(model_name=model_name)
+
+# --- 2. 定義向量庫建立函式 ---
+def build_vector_store(docs):
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_community.vectorstores import FAISS
+    
+    # 1. 切片邏輯 (Chunking)
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800, 
+        chunk_overlap=200,
+        length_function=len,
+        separators=["\n\n", "\n", "。", " ", ""], 
+    )
+    split_docs = text_splitter.split_documents(docs)
+    # 2. 建立索引 (呼叫正確的 get_embedding_model 函式)
+    with st.spinner("正在啟動 Embedding 引擎並建立向量索引..."):
+        # 修正：直接呼叫 get_embedding_model() 作為參數傳入
+        vector_db = FAISS.from_documents(split_docs, get_embedding_model())
+    
+    return vector_db
+
+# --- 3. 定義檢索函式 ---
+# def get_relevant_context(query, vector_db, k_value):
+#     # 1. 執行原始向量檢索
+#     docs = vector_db.similarity_search(query, k=k_value)
+#     st.sidebar.caption(f"🔍 當前執行 K={k_value}")
+#     # 提取內容並組合
+#     context_list = [doc.page_content for doc in docs]
+        
+#     return "\n\n---\n\n".join([doc.page_content for doc in docs])
+
+def get_relevant_context(query, vector_db, k_value):
+    # 💡 使用 MMR 搜尋：fetch_k 是先抓多少筆，k 是最後留幾筆
+    docs = vector_db.max_marginal_relevance_search(
+        query, 
+        k=k_value, 
+        fetch_k=k_value * 2,
+        lambda_mult=0.5 # 0.5 是平衡語意相關度與多樣性
+    )
+    
+    st.sidebar.caption(f"🔍 MMR 多樣性檢索 K={k_value}")
+    return "\n\n---\n\n".join([doc.page_content for doc in docs])
+
+# 5. 頁面邏輯切換
+
+# --- 頁面一：手冊解析 ---
+if page == "手冊解析與校對":
+    
+    st.title("📄 知識庫管理")
+
+    tab_manual, tab_testset = st.tabs(["📁 上傳手冊 (PDF)", "🧪 測試資料集 (DRCD)"])
+
+    with tab_manual:
+        st.subheader("PDF 手冊解析")
+        uploaded_file = st.file_uploader("選擇 PDF 文件", type="pdf", key="manual_uploader")
+        
+        if uploaded_file:
+            # 找到「🔍 開始提取文本」按鈕內的邏輯
+            if st.button("🔍 開始提取文本"):
+                with st.spinner("正在讀取 PDF..."):
+                    reader = PdfReader(uploaded_file)
+                    documents = []
+                    for i, p in enumerate(reader.pages):
+                        t = p.extract_text()
+                        if t:
+                            clean_text = t.strip()
+                            # 這裡將 metadata={"page": i + 1} 移除，改為空字典
+                            documents.append(Document(page_content=clean_text, metadata={}))  
+                                # 存入 Session State 供後續 build_vector_store 使用
+                    st.session_state['temp_docs'] = documents 
+                    # 為了顯示在編輯區，還是保留一份純文字
+                    st.session_state['text_area_input'] = "\n\n".join([doc.page_content for doc in documents])
+                    st.success(f"解析成功！共 {len(reader.pages)} 頁。")
+
+        
+        
+
+    with tab_testset:
+        st.subheader("MediaTek-Research TCEval-v2")
+        
+        # 取得資料集 (確認 df_test 存在)
+        df_test = get_test_dataset()
+        
+        # 初始化註解 session
+        if "test_notes" not in st.session_state:
+            st.session_state.test_notes = df_test.assign(備註="")
+
+        # 顯示可編輯表格
+        edited_df = st.data_editor(
+            st.session_state.test_notes,
+            column_config={
+                "context": st.column_config.TextColumn("文章內容", width="medium"),
+                "question": "問題",
+                "answers": "標準答案",
+                "備註": st.column_config.TextColumn("我的註解", help="雙擊即可編輯筆記")
+            },
+            disabled=["context", "question", "answers"],
+            hide_index=True,
+            height=300,
+            key="data_editor_test"
+        )
+        st.divider()
+        st.subheader("🚀 知識庫批量導入")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            selected_row = st.selectbox("選擇單一資料導入：", range(len(df_test)))
+            if st.button("單筆導入"):
+                target_data = df_test.iloc[selected_row]
+                possible_keys = ['context', 'paragraph', 'text', 'content']
+                found_content = next((target_data[k] for k in possible_keys if k in target_data), "")
+                
+                if found_content:
+                    st.session_state['temp_text'] = found_content
+                    st.session_state['manual_context'] = found_content
+                    st.success(f"✅ 已導入第 {selected_row} 筆！")
+                    st.rerun()
+
+        with col2:
+            st.write("一次導入整份資料集")
+            if st.button("🔥 全部導入 (批次模式)"):
+                with st.spinner("正在合併所有資料內容..."):
+                    # 自動尋找內容欄位
+                    possible_keys = ['context', 'paragraph', 'text', 'content']
+                    found_key = next((k for k in df_test.columns if k in possible_keys), None)
+                    
+                    if found_key:
+                        # 將所有文章內容合併，中間用換行隔開
+                        all_contexts = df_test[found_key].drop_duplicates().tolist()
+                        combined_text = "\n\n--- 資料邊界 ---\n\n".join(all_contexts)
+                        
+                        st.session_state['temp_text'] = combined_text
+                        st.session_state['manual_context'] = combined_text
+                        st.session_state['text_area_input'] = combined_text
+                        
+                        st.success(f"✅ 已成功導入全部 {len(all_contexts)} 篇不重複文章！")
+                        st.rerun()
+                    else:
+                        st.error("❌ 找不到可合併的欄位。")
+                        st.subheader("📝 知識庫內容確認")       
+
+    # --- 校對與確認區 (獨立於 Tab 之外) ---
+    st.divider()
+    st.subheader("📝 知識庫內容確認")
+    c1, c2 = st.columns([4, 1]) 
+# --- 在 67.py 中找到「執行疊字清理」的按鈕邏輯進行更換 ---
+
+    with c2:
+        if st.button("🧹 執行疊字清理", help="針對 PDF 產生的重複字元進行過濾"):
+            # 1. 取得目前「編輯區」內正在編輯的文字
+            # 如果編輯區是空的，則嘗試抓取剛解析完的暫存文字
+            current_text = st.session_state.get('text_area_input', "")
+            
+            if current_text:
+                with st.spinner("正在清理疊字..."):
+                    # 2. 執行清理函數
+                    cleaned = clean_duplicated_text(current_text)
+                    
+                     
+                    # 這樣清理完的結果會填回 text_area，但不會動到 st.session_state['manual_context']
+                    st.session_state['text_area_input'] = cleaned
+                    
+                    st.success("清理完成！內容已更新於下方編輯區，請確認後再存入正式庫。")
+                    
+                    # 4. 強制重新渲染，讓 text_area 顯示新內容
+                    st.rerun()
+        else:
+            st.warning("暫存區無內容可處理。")
+    with c1:
+        # 取得顯示用的字數
+        display_val = st.session_state.get('text_area_input', st.session_state.get('temp_text', ""))
+        
+        if not display_val:
+            st.warning("⚠️ 目前暫存區無資料，請先上傳 PDF 或從測試集導入。")
+        else:
+            st.info(f"📊 目前暫存內容字數：{len(display_val)} 字")
+
+    
+    edited_text = st.text_area(
+        "校對編輯區：(確定內容後請按下方按鈕存入知識庫)", 
+        # value=st.session_state.get('temp_text', ""), 
+        key="text_area_input", # 統一使用這個 key
+        height=500,
+    )
+
+    if st.button("✅ 確認存入正式知識庫 (RAG)"):
+        # 1. 直接從編輯區抓取「畫面上最終顯示」的文字 (包含清理後的內容)
+        final_text = st.session_state.get('text_area_input', "").strip()
+        
+        if final_text:
+            with st.spinner("正在同步至正式資料庫..."):
+                # 將「校對編輯區」的文字包裝成新的 Document 物件，確保向量庫抓到的是清理過的文字
+                from langchain_core.documents import Document
+                
+               
+
+                final_docs = [Document(page_content=final_text, metadata={})]
+                if len(final_text) > 10000:
+                    # 大量資料：建立向量庫
+                    st.session_state['vector_db'] = build_vector_store(final_docs)
+                    # 在 67.py 加入這行，把向量庫存到硬碟
+                    st.session_state['vector_db'].save_local("faiss_index_storage")#for dc bot
+                    st.session_state['manual_context'] = final_text
+                    st.success(f"✅ 已建立向量資料庫 (共 {len(final_text)} 字)")
+                else:
+                    # 少量資料：純文字模式
+                    # 少量資料模式，也建議存成一個 txt 讓 Discord 讀取
+                    with open("temp_context.txt", "w", encoding="utf-8") as f:
+                        f.write(final_text)
+                    st.session_state['manual_context'] = final_text
+                    if 'vector_db' in st.session_state:
+                        del st.session_state['vector_db']
+                    st.success("✅ 已存入正式資料庫 (純文字模式)。")
+                
+                st.rerun()
+        else:
+            st.error("內容為空，無法存入")
+  
+# --- 頁面二：正式知識庫管理 (新增) ---
+elif page == "正式資料庫管理":
+    st.title("正式資料庫管理")
+    st.info("這裡顯示的是 AI 目前在對話中使用的最終版本內容，可以在此修正錯誤並重新更新資料庫。")
+
+    if 'manual_context' in st.session_state and st.session_state['manual_context']:
+        # 1. 顯示統計資訊
+        col1, col2 = st.columns(2)
+        current_text = st.session_state['manual_context']
+        
+        with col1:
+            st.metric("📊 目前總字數", f"{len(current_text)} 字")
+        with col2:
+            db_status = "已啟用 ⚡ (RAG)" if 'vector_db' in st.session_state else "純文字模式 📄"
+            st.metric("狀態", db_status)
+
+        st.divider()
+
+        # 2. 編輯區：顯示所有字並允許修正
+        st.subheader("📝 修正正式資料內容")
+        new_fixed_text = st.text_area(
+            "您可以直接在此修改文字，修正後請按下方更新按鈕：",
+            value=current_text,
+            height=600,
+            key="final_db_editor"
+        )
+
+        # 3. 重新上傳/更新邏輯
+        if st.button("🔥 修正並重新上傳至正式資料庫 (更新 RAG)"):
+            if new_fixed_text:
+                with st.spinner("正在根據修正內容重新建立資料庫..."):
+                    # 更新文字紀錄
+                    st.session_state['manual_context'] = new_fixed_text
+                    
+                    # 判斷是否需要重新向量化
+                    if len(new_fixed_text) > 10000:
+                        # 將文字轉為臨時 Document 物件
+                        new_docs = [Document(page_content=new_fixed_text, metadata={"page": "修正版本"})]
+                        st.session_state['vector_db'] = build_vector_store(new_docs)
+                        st.success("✅ 修正完成，已重新建立大型向量資料庫！")
+                    else:
+                        # 字數不多，清除向量庫改用純文字檢索
+                        if 'vector_db' in st.session_state:
+                            del st.session_state['vector_db']
+                        st.success("✅ 修正完成，已更新暫存區內容。")
+                    
+                    st.balloons()
+                    st.rerun()
+            else:
+                st.error("內容不能為空！")
+    else:
+        st.warning("⚠️ 目前正式知識庫內沒有資料，請先前往「手冊解析與校對」頁面存入內容。")
+    
+# --- 頁面二：獨立對話頁面 ---
+
+elif page == "AI對話機器人":
+    st.title("AI對話機器人")
+    
+    # 1. 顯示完整歷史對話紀錄 (確保前端與記憶同步)
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"], unsafe_allow_html=True)
+
+    if prompt := st.chat_input("請問關於公司的規定..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):  
+            if st.session_state.get('vector_db'):
+                # 💡 修正：從 session_state 讀取您在 Slider 設定的數值，若無則預設為 5
+                current_k = st.session_state.get('dynamic_k', 5)
+                
+                # 將 k=5 改為 k=current_k
+                docs = st.session_state['vector_db'].similarity_search(prompt, k=current_k)
+                
+                # --- Debug 展開視窗 ---
+                with st.expander(f"🔍 檢索到的原始片段 (Debug) - 目前 K={current_k}"):
+                    for i, d in enumerate(docs):
+                        st.write(f"片段 {i+1}:")
+                        st.code(d.page_content)
+                # ---------------------
+                
+                context = "\n\n---\n\n".join([d.page_content for d in docs])
+            # ✅ 定義更具包容性的系統指令
+            system_instruction = """你現在是一位專業的企業行政助手。
+            你的唯一任務是根據使用者提供的【手冊知識庫】回答每個問題。
+            【強制規則】：
+            1. 必須完全使用「繁體中文」（台灣習慣用語）回答。
+            2. 絕對禁止使用簡體中文。
+            3. 如果手冊中沒有答案，請禮貌地說找不到，不要編造。
+            4. 保持專業、客觀、準確。
+            5. 遇到打招呼（如：你好、早安），請用親切的語氣直接與使用者寒暄。
+            6. 遇到使用者輸入完全無意義的亂碼時，請禮貌地表達你聽不懂，並引導使用者詢問手冊相關問題。
+             """
+
+
+           
+            SPELL_67 = "欸six seven🗣️🗣️🔥🔥🔥"
+            if "67" in prompt or "six seven" in prompt.lower():
+                answer = SPELL_67
+            else:
+                # 獲取 RAG 背景資料
+                if st.session_state.get('vector_db'):
+                    context = get_relevant_context(prompt, st.session_state['vector_db'], st.session_state['dynamic_k'])
+                else:
+                    context = st.session_state.get('manual_context', "")
+
+                full_prompt = f"【手冊內容】：\n{context}\n\n當前問題：{prompt}"
+
+                # 組合歷史紀錄傳給 Ollama
+                chat_messages = [{'role': 'system', 'content': system_instruction}]
+                # 將過去的對話歷史加入 (排除掉最後剛加進去的當前 prompt)
+                # for m in st.session_state.messages[:-1]:
+                #     chat_messages.append({'role': m['role'], 'content': m['content']})
+                # 加入最新的 User Prompt (包含 Context)
+                chat_messages.append({'role': 'user', 'content': full_prompt})
+
+                try:
+                    response = chat(
+                        model=target_model,
+                        messages=chat_messages, # 傳送包含歷史的清單
+                        options={"temperature": 0.05, "num_predict": 1000}
+                    )
+                    answer = response.message.content
+                except Exception as e:
+                    answer = f"連線失敗：{e}"
+
+            # 顯示並存檔
+            st.markdown(answer, unsafe_allow_html=True)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
