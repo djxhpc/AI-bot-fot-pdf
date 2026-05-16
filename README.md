@@ -15,6 +15,12 @@ ollama run ycchen/breeze-7b-instruct-v1_0:latest
 ```bash
 streamlit run AI-bot-fot-pdf.py
 ```
+#  主頁
+![測試圖片](./1.png)
+#  資料庫頁面
+![測試圖片](./2.png)
+#  對話頁面
+![測試圖片](./3.png)
 
 # 2. 評分
 
