@@ -7,7 +7,12 @@
 ```bash
 pip install -r requirements.txt
 ```
-#### 啟動 Ollama 並下載模型
+#### 下載 Ollama (Windows)
+```bash
+irm https://ollama.com/install.ps1 | iex
+```
+
+#### 下載 Ollama 模型
 ```bash
 ollama run ycchen/breeze-7b-instruct-v1_0:latest
 ```
