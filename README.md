@@ -11,6 +11,14 @@ pip install -r requirements.txt
 ```bash
 ollama run ycchen/breeze-7b-instruct-v1_0:latest
 ```
+> ollama run cwchang/llama3-taide-lx-8b-chat-alpha1:latest
+
+> ollama run gemma4:latest
+
+> ollama run qwen2.5:latest
+
+> ollama run llama3.2:latest
+
 #### 啟動
 ```bash
 streamlit run AI-bot-fot-pdf.py
