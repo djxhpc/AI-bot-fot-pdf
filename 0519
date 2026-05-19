@@ -1,0 +1,53 @@
+
+def get_relevant_context(query, vector_db, k_value, all_docs, keyword_weight=0.3):
+    """
+    混合搜尋：結合向量搜尋（語義）和關鍵字搜尋（BM25）
+    
+    參數：
+    - query: 查詢文本
+    - vector_db: 向量庫
+    - k_value: 返回結果數
+    - all_docs: 所有文檔（用於關鍵字搜尋）
+    - keyword_weight: 關鍵字搜尋的權重（0.0-1.0）
+    """
+    from collections import defaultdict
+    import re
+    
+    # 1. 向量搜尋
+    vector_results = vector_db.similarity_search(query, k=k_value * 2)
+    vector_scores = {doc.page_content: 1.0 - (i / (k_value * 2)) for i, doc in enumerate(vector_results)}
+    
+    # 2. 關鍵字搜尋（BM25 類似）
+    query_terms = re.findall(r'[\u4e00-\u9fa5]+', query.lower())  # 提取中文詞
+    keyword_scores = defaultdict(float)
+    
+    for doc in all_docs:
+        content_lower = doc.page_content.lower()
+        # 計算查詢詞在文檔中出現的次數
+        for term in query_terms:
+            count = content_lower.count(term)
+            if count > 0:
+                # TF 類似的加權
+                keyword_scores[doc.page_content] += min(count, 5) / 5.0
+    
+    # 正規化關鍵字得分
+    if keyword_scores:
+        max_keyword_score = max(keyword_scores.values())
+        if max_keyword_score > 0:
+            keyword_scores = {k: v / max_keyword_score for k, v in keyword_scores.items()}
+    
+    # 3. 合併得分
+    combined_scores = defaultdict(float)
+    for content, score in vector_scores.items():
+        combined_scores[content] += (1 - keyword_weight) * score
+    
+    for content, score in keyword_scores.items():
+        combined_scores[content] += keyword_weight * score
+    
+    # 4. 排序並返回前 k 個
+    sorted_docs = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)[:k_value]
+    result_content = "\n\n---\n\n".join([content for content, _ in sorted_docs])
+    
+    st.sidebar.caption(f"🔀 混合搜尋 K={k_value}（{int((1-keyword_weight)*100)}% 語義 + {int(keyword_weight*100)}% 關鍵字）")
+    
+    return result_content
