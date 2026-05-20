@@ -5,6 +5,7 @@ import ollama
 from datasets import load_dataset
 import pandas as pd
 import re
+import ast
 from langchain_core.documents import Document
 
 # 1. 頁面配置
@@ -105,8 +106,18 @@ with st.sidebar:
 
 @st.cache_data
 def get_test_dataset():
+    # 載入 MediaTek-Research/TCEval-v2 的 drcd 測試集
     dataset = load_dataset("MediaTek-Research/TCEval-v2", "drcd", split='test')
-    return pd.DataFrame(dataset)
+    df = pd.DataFrame(dataset)
+    
+    # 🔍 【重要修正】：防呆欄位對齊
+    # TCEval 的文章欄位通常叫 'paragraph'，若不存在 'context' 則手動複製一份對齊名稱
+    if "paragraph" in df.columns and "context" not in df.columns:
+        df["context"] = df["paragraph"]
+    elif "text" in df.columns and "context" not in df.columns:
+        df["context"] = df["text"]
+        
+    return df
 
 def clean_duplicated_text(text):
     if not text:
@@ -123,14 +134,13 @@ def clean_duplicated_text(text):
 # --- 1. 載入 Embedding 與 Reranker 模型 ---
 @st.cache_resource
 def get_embedding_model():
-    from langchain_huggingface import HuggingFaceEmbeddings  # ✅ 完全修正拼字
+    from langchain_huggingface import HuggingFaceEmbeddings  
     model_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    return HuggingFaceEmbeddings(model_name=model_name)      # ✅ 完全修正拼字
+    return HuggingFaceEmbeddings(model_name=model_name)      
 
 @st.cache_resource
 def get_reranker_model():
     from sentence_transformers import CrossEncoder
-    # 使用支援多國語言（含繁中）的輕量級 Cross-Encoder 作為重排模型
     model_name = "BAAI/bge-reranker-base"
     return CrossEncoder(model_name)
 
@@ -149,12 +159,9 @@ def build_vector_store(docs):
     split_docs = text_splitter.split_documents(docs)
     
     with st.spinner("正在建立混合索引 (FAISS 向量庫 + BM25 關鍵字庫)..."):
-        # 建立 FAISS 向量庫
         vector_db = FAISS.from_documents(split_docs, get_embedding_model())
-        # 建立 BM25 關鍵字檢索器
         bm25_retriever = BM25Retriever.from_documents(split_docs)
         
-    # 將兩者綁定一起回傳
     return {"vector_db": vector_db, "bm25_retriever": bm25_retriever}
 
 # --- 3. 混合檢索 (Hybrid Search) + 重排 (Reranking) 核心函式 ---
@@ -162,17 +169,13 @@ def get_relevant_context(query, hybrid_db, k_value):
     vector_db = hybrid_db["vector_db"]
     bm25_retriever = hybrid_db["bm25_retriever"]
     
-    # 為了讓 Reranker 有挑選空間，初篩抓取較多候選者 (K 的 3 倍)
     candidate_k = max(k_value * 3, 15)
     
-    # 1. 向量搜尋 (Dense Retrieval)
     dense_docs = vector_db.similarity_search(query, k=candidate_k)
     
-    # 2. 關鍵字搜尋 (Sparse Retrieval)
     bm25_retriever.k = candidate_k
     sparse_docs = bm25_retriever.invoke(query)
     
-    # 3. 混合結果並去重
     seen_contents = set()
     unique_candidates = []
     for doc in dense_docs + sparse_docs:
@@ -180,27 +183,52 @@ def get_relevant_context(query, hybrid_db, k_value):
             seen_contents.add(doc.page_content)
             unique_candidates.append(doc)
             
-    # 4. Reranking 重排階段
     if not unique_candidates:
         return "", []
         
     reranker = get_reranker_model()
-    # 建立 Cross-Encoder 輸入格式: [[query, doc1], [query, doc2], ...]
     pairs = [[query, doc.page_content] for doc in unique_candidates]
     scores = reranker.predict(pairs)
     
-    # 將分數與 Document 組合，並由高到低排序
     scored_docs = sorted(zip(scores, unique_candidates), key=lambda x: x[0], reverse=True)
     
-    # 5. 取出前 K 高分的菁英片段
     top_k_scored = scored_docs[:k_value]
     final_docs = [doc for score, doc in top_k_scored]
     
-    # st.sidebar.caption(f"混合檢索成功！初篩 {len(unique_candidates)} 筆 ➡️ Rerank 精選 {len(final_docs)} 筆")
-    
-    # 回傳組合好的文本，以及包含分數的物件供前端 Debug 顯示
     context_text = "\n\n---\n\n".join([doc.page_content for doc in final_docs])
     return context_text, top_k_scored
+
+
+# --- 4. 寬鬆比對邏輯（字有一樣就算中、複數答案中一個就算中） ---
+def verify_answer(model_out, ground_truths):
+    if not model_out:
+        return "❌ 失敗 (無輸出)"
+    
+    # 轉換成小寫並移除前後空白，做標準化基本防呆
+    model_out_clean = str(model_out).strip().lower()
+    
+    # 確保標準答案轉換成 Python list
+    if isinstance(ground_truths, str):
+        # 處理形如 "['A', 'B']" 的字串陣列型態
+        if ground_truths.startswith('[') and ground_truths.endswith(']'):
+            try:
+                ground_truths = ast.literal_eval(ground_truths)
+            except:
+                ground_truths = [ground_truths]
+        else:
+            ground_truths = [ground_truths]
+    elif isinstance(ground_truths, (list, set, tuple)):
+        ground_truths = list(ground_truths)
+    else:
+        ground_truths = [str(ground_truths)]
+        
+    # 比對邏輯：複數答案中只要有一個字串被包含在模型回答內，即判定為通過
+    for ans in ground_truths:
+        ans_clean = str(ans).strip().lower()
+        if ans_clean and ans_clean in model_out_clean:
+            return "✅ 通過"
+            
+    return "❌ 失敗"
 
 
 # --- 5. 頁面邏輯切換 ---
@@ -228,155 +256,301 @@ if page == "手冊解析與校對":
                     st.session_state['text_area_input'] = "\n\n".join([doc.page_content for doc in documents])
                     st.success(f"解析成功！共 {len(reader.pages)} 頁。")
 
-
-with tab_testset:
-        st.subheader("MediaTek-Research TCEval-v2 評測與自動比對")
+    with tab_testset:
+        st.subheader("MediaTek-Research TCEval-v2")
         df_test = get_test_dataset()
         
-        # 初始化測試備註與評測結果的 session_state
+        # 初始化測試交互 Session 表格，包含評測用欄位
         if "test_notes" not in st.session_state:
-            st.session_state.test_notes = df_test.assign(
-                模型回答="", 
-                比對結果="", 
-                備註=""
-            )
+            st.session_state.test_notes = df_test.assign(模型回答="", 判定結果="", 備註="")
 
-        # 顯示資料編輯器
+        # 資料表格編輯器顯示
         edited_df = st.data_editor(
             st.session_state.test_notes,
             column_config={
-                "context": st.column_config.TextColumn("文章內容", width="small"),
-                "question": st.column_config.TextColumn("問題", width="medium"),
+                "context": st.column_config.TextColumn("文章內容", width="medium"),
+                "question": "問題",
                 "answers": "標準答案",
                 "模型回答": st.column_config.TextColumn("模型回答", width="medium"),
-                "比對結果": "比對結果",
+                "判定結果": "判定結果",
                 "備註": st.column_config.TextColumn("我的註解", help="雙擊即可編輯筆記")
             },
-            disabled=["context", "question", "answers", "模型回答", "比對結果"],
-            hide_index=False,
+            disabled=["context", "question", "answers", "模型回答", "判定結果"],
+            hide_index=True,
             height=300,
             key="data_editor_test"
         )
+        # 同步更新編輯器暫存
+        st.session_state.test_notes.update(edited_df)
         
         st.divider()
-        st.subheader("🤖 批量模型自動評測")
+        st.subheader("🚀 知識庫與模型測試工具")
+        col_test1, col_test2 = st.columns(2)
         
-        # 讓使用者選擇要測試的資料範圍
-        col_range1, col_range2 = st.columns(2)
-        with col_range1:
-            start_idx = st.number_input("測試起始 Index", min_value=0, max_value=len(df_test)-1, value=0)
-        with col_range2:
-            end_idx = st.number_input("測試結束 Index", min_value=start_idx, max_value=len(df_test)-1, value=min(start_idx + 4, len(df_test)-1))
+        # 定義評測專用的 System Instruction
+        test_system_instruction = """你現在是一位專業的企業行政助手。
+        請根據用戶提供的【手冊內容】嚴謹、精準且簡短地回答問題。
+        如果手冊中沒有答案，請禮貌地說找不到，不要編造。"""
+
+        with col_test1:
+            st.markdown("### 🔍 單筆測試與導入")
+            selected_row = st.selectbox("選擇指定資料列：", range(len(df_test)))
             
-        if st.button("🚀 開始批量測試與比對答案"):
-            # 建立進度條
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
+            sub_c1, sub_c2 = st.columns(2)
+            with sub_c1:
+                if st.button("單筆導入知識庫"):
+                    target_data = df_test.iloc[selected_row]
+                    found_content = target_data.get('context', "")
+                    if found_content:
+                        st.session_state['temp_text'] = found_content
+                        st.session_state['manual_context'] = found_content
+                        st.session_state['text_area_input'] = found_content
+                        st.success(f"✅ 已導入第 {selected_row} 筆文章至暫存區！")
+                        st.rerun()
             
-            # 複製一份現有的資料庫來儲存評測結果
-            updated_notes = st.session_state.test_notes.copy()
-            
-            correct_count = 0
-            total_tested = end_idx - start_idx + 1
-            
-            # 遍歷指定範圍的測資
-            for idx in range(start_idx, end_idx + 1):
-                row = df_test.iloc[idx]
-                context = row.get('context', row.get('paragraph', ''))
-                question = row['question']
-                
-                # 處理複數答案的情況（TCEval 的 answers 通常是 list 格式）
-                gold_answers = row['answers']
-                if isinstance(gold_answers, str):
-                    gold_answers = [gold_answers] # 確保轉成 list 方便走訪
-                
-                # 建立臨時 RAG 檢索：如果目前有正式 RAG 庫，就用 RAG 搜尋；否則直接用該題的 context 當背景
-                if st.session_state.get('vector_db'):
-                    current_k = st.session_state.get('dynamic_k', 5)
-                    search_context, _ = get_relevant_context(question, st.session_state['vector_db'], current_k)
-                else:
-                    search_context = context
-                
-                # 組織 Prompt 發送給 Ollama 模型
-                system_instruction = """你現在是一位專業的企業行政助手。請根據提供的【手冊內容】精準回答問題。
-                回答必須使用「繁體中文」（台灣習慣用語），且點出核心答案即可，嚴禁憑空捏造。"""
-                
-                full_prompt = f"【手冊內容】：\n{search_context}\n\n當前問題：{question}"
-                chat_messages = [
-                    {'role': 'system', 'content': system_instruction},
-                    {'role': 'user', 'content': full_prompt}
-                ]
-                
-                status_text.text(f"正在評測第 {idx} 筆資料...")
-                
-                try:
-                    response = chat(
-                        model=target_model,
-                        messages=chat_messages,
-                        options={"temperature": 0.0, "num_predict": 500}
-                    )
-                    model_reply = response.message.content.strip()
-                except Exception as e:
-                    model_reply = f"模型呼叫失敗：{e}"
-                
-                # --- 🎯 關鍵比對邏輯 🎯 ---
-                # 規則：模型回答只要「包含」任一個標準答案（複數答案中一個就算）即判定為正確
-                is_correct = False
-                for ans in gold_answers:
-                    if str(ans).strip() in model_reply:
-                        is_correct = True
-                        break # 中一個就夠了，跳出迴圈
-                
-                # 記錄結果
-                updated_notes.at[idx, "模型回答"] = model_reply
-                if is_correct:
-                    updated_notes.at[idx, "比對結果"] = "✅ 正確"
-                    correct_count += 1
-                else:
-                    updated_notes.at[idx, "比對結果"] = "❌ 錯誤"
+            with sub_c2:
+                if st.button("🏃 執行單筆比對測試"):
+                    target_data = st.session_state.test_notes.iloc[selected_row]
+                    full_prompt = f"【手冊內容】如下：\n{target_data['context']}\n\n當前問題：{target_data['question']}"
                     
-                # 更新進度條
-                progress_bar.progress((idx - start_idx + 1) / total_tested)
+                    with st.spinner("模型回答中..."):
+                        try:
+                            res = chat(
+                                model=target_model,
+                                messages=[
+                                    {'role': 'system', 'content': test_system_instruction},
+                                    {'role': 'user', 'content': full_prompt}
+                                ],
+                                options={"temperature": 0.0, "num_predict": 500}
+                            )
+                            model_ans = res.message.content
+                            result_status = verify_answer(model_ans, target_data['answers'])
+                            
+                            st.session_state.test_notes.at[selected_row, "模型回答"] = model_ans
+                            st.session_state.test_notes.at[selected_row, "判定結果"] = result_status
+                            
+                            if "✅" in result_status:
+                                st.success(f"比對結果：{result_status}")
+                            else:
+                                st.error(f"比對結果：{result_status}")
+                                
+                            st.info(f"💡 標準答案：{target_data['answers']}\n\n🤖 模型回答：{model_ans}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"測試連線失敗：{e}")
+
+        with col_test2:
+            st.markdown("### 📊 自動化批次評測")
+            st.write("讓當前選擇的模型自動跑完表格內所有題目，並計算出最終的精確度。")
             
-            # 將結果更新回 Session State 並重新整理畫面
-            st.session_state.test_notes = updated_notes
-            status_text.empty()
-            progress_bar.empty()
-            
-            # 顯示統計數據
-            accuracy = (correct_count / total_tested) * 100
-            st.success(f"📊 測試完成！區間：{start_idx} ~ {end_idx} | 答對題數：{correct_count}/{total_tested} | 準確度：{accuracy:.2f}%")
-            st.rerun()
+            if st.button("⚡ 啟動全自動評測"):
+                total_rows = len(st.session_state.test_notes)
+                success_count = 0
+                
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for idx in range(total_rows):
+                    target_data = st.session_state.test_notes.iloc[idx]
+                    status_text.text(f"⏳ 正在評測第 {idx+1}/{total_rows} 筆... (目前通過: {success_count} 筆)")
+                    
+                    full_prompt = f"【手冊內容】如下：\n{target_data['context']}\n\n當前問題：{target_data['question']}"
+                    
+                    try:
+                        res = chat(
+                            model=target_model,
+                            messages=[
+                                {'role': 'system', 'content': test_system_instruction},
+                                {'role': 'user', 'content': full_prompt}
+                            ],
+                            options={"temperature": 0.0, "num_predict": 300}
+                        )
+                        model_ans = res.message.content
+                        result_status = verify_answer(model_ans, target_data['answers'])
+                    except Exception as e:
+                        model_ans = f"錯誤: {e}"
+                        result_status = "❌ 失敗 (連線異常)"
+                    
+                    if "✅" in result_status:
+                        success_count += 1
+                        
+                    st.session_state.test_notes.at[idx, "模型回答"] = model_ans
+                    st.session_state.test_notes.at[idx, "判定結果"] = result_status
+                    
+                    progress_bar.progress((idx + 1) / total_rows)
+                
+                status_text.empty()
+                progress_bar.empty()
+                
+                accuracy = (success_count / total_rows) * 100
+                st.success(f"🏁 評測完成！總題數: {total_rows} | 成功通過: {success_count} 筆 | 準確率 (Accuracy): {accuracy:.2f}%")
+                st.balloons()
+                st.rerun()
 
         st.divider()
-        st.subheader("🚀 知識庫批量導入")
+        st.subheader("📚 舊版整份導入")
+        if st.button("全部導入至暫存區"):
+            with st.spinner("正在合併所有資料內容..."):
+                if "context" in df_test.columns:
+                    all_contexts = df_test["context"].drop_duplicates().tolist()
+                    combined_text = "\n\n--- 資料邊界 ---\n\n".join(all_contexts)
+                    st.session_state['temp_text'] = combined_text
+                    st.session_state['manual_context'] = combined_text
+                    st.session_state['text_area_input'] = combined_text
+                    st.success(f"✅ 已成功導入全部 {len(all_contexts)} 篇不重複文章！")
+                    st.rerun()
+                else:
+                    st.error("❌ 找不到可合併的欄位。")
+
+    st.divider()
+    st.subheader("📝 知識庫內容確認")
+    c1, c2 = st.columns([4, 1]) 
+
+    with c2:
+        if st.button("🧹 執行疊字清理", help="針對 PDF 產生的重複字元進行過濾"):
+            current_text = st.session_state.get('text_area_input', "")
+            if current_text:
+                with st.spinner("正在清理疊字..."):
+                    cleaned = clean_duplicated_text(current_text)
+                    st.session_state['text_area_input'] = cleaned
+                    st.success("清理完成！")
+                    st.rerun()
+            else:
+                st.warning("暫存區無內容可處理。")
+    with c1:
+        display_val = st.session_state.get('text_area_input', st.session_state.get('temp_text', ""))
+        if not display_val:
+            st.warning("⚠️ 目前暫存區無資料，請先上傳 PDF 或從測試集導入。")
+        else:
+            st.info(f"📊 目前暫存內容字數：{len(display_val)} 字")
+
+    edited_text = st.text_area(
+        "校對編輯區：(確定內容後請按下方按鈕存入知識庫)", 
+        key="text_area_input",
+        height=500,
+    )
+
+    if st.button("✅ 確認存入正式知識庫 (RAG)"):
+        final_text = st.session_state.get('text_area_input', "").strip()
+        if final_text:
+            with st.spinner("正在同步至正式資料庫..."):
+                final_docs = [Document(page_content=final_text, metadata={})]
+                if len(final_text) > 10000:
+                    st.session_state['vector_db'] = build_vector_store(final_docs)
+                    st.session_state['vector_db']["vector_db"].save_local("faiss_index_storage")
+                    st.session_state['manual_context'] = final_text
+                    st.success(f"✅ 已建立混合搜尋與重排資料庫 (共 {len(final_text)} 字)")
+                else:
+                    with open("temp_context.txt", "w", encoding="utf-8") as f:
+                        f.write(final_text)
+                    st.session_state['manual_context'] = final_text
+                    if 'vector_db' in st.session_state:
+                        del st.session_state['vector_db']
+                    st.success("✅ 已存入正式資料庫 (純文字模式)。")
+                st.rerun()
+        else:
+            st.error("內容為空，無法存入")
+  
+# --- 頁面二：正式知識庫管理 ---
+elif page == "正式資料庫管理":
+    st.title("正式資料庫管理")
+    st.info("這裡顯示的是 AI 目前在對話中使用的最終版本內容，可以在此修正錯誤並重新更新資料庫。")
+
+    if 'manual_context' in st.session_state and st.session_state['manual_context']:
         col1, col2 = st.columns(2)
+        current_text = st.session_state['manual_context']
         
         with col1:
-            selected_row = st.selectbox("選擇單一資料導入：", range(len(df_test)))
-            if st.button("單筆導入"):
-                target_data = df_test.iloc[selected_row]
-                possible_keys = ['context', 'paragraph', 'text', 'content']
-                found_content = next((target_data[k] for k in possible_keys if k in target_data), "")
-                if found_content:
-                    st.session_state['temp_text'] = found_content
-                    st.session_state['manual_context'] = found_content
-                    st.success(f"✅ 已導入第 {selected_row} 筆！")
-                    st.rerun()
-
+            st.metric("📊 目前總字數", f"{len(current_text)} 字")
         with col2:
-            st.write("一次導入整份資料集")
-            if st.button("全部導入"):
-                with st.spinner("正在合併所有資料內容..."):
-                    possible_keys = ['context', 'paragraph', 'text', 'content']
-                    found_key = next((k for k in df_test.columns if k in possible_keys), None)
-                    if found_key:
-                        all_contexts = df_test[found_key].drop_duplicates().tolist()
-                        combined_text = "\n\n--- 資料邊界 ---\n\n".join(all_contexts)
-                        st.session_state['temp_text'] = combined_text
-                        st.session_state['manual_context'] = combined_text
-                        st.session_state['text_area_input'] = combined_text
-                        st.success(f"✅ 已成功導入全部 {len(all_contexts)} 篇不重複文章！")
-                        st.rerun()
+            db_status = "已啟用 ⚡ (Hybrid Search + Rerank)" if 'vector_db' in st.session_state else "純文字模式 📄"
+            st.metric("狀態", db_status)
+
+        st.divider()
+        st.subheader("📝 修正正式資料內容")
+        new_fixed_text = st.text_area(
+            "您可以直接在此修改文字，修正後請按下方更新按鈕：",
+            value=current_text,
+            height=600,
+            key="final_db_editor"
+        )
+
+        if st.button("修正並重新上傳至正式資料庫 (更新 RAG)"):
+            if new_fixed_text:
+                with st.spinner("正在根據修正內容重新建立資料庫..."):
+                    st.session_state['manual_context'] = new_fixed_text
+                    if len(new_fixed_text) > 10000:
+                        new_docs = [Document(page_content=new_fixed_text, metadata={"page": "修正版本"})]
+                        st.session_state['vector_db'] = build_vector_store(new_docs)
+                        st.success("✅ 修正完成，已重新建立混合檢索與重排資料庫！")
                     else:
-                        st.error("❌ 找不到可合併的欄位。")
+                        if 'vector_db' in st.session_state:
+                            del st.session_state['vector_db']
+                        st.success("✅ 修正完成，已更新暫存區內容。")
+                    st.balloons()
+                    st.rerun()
+            else:
+                st.error("內容不能為空！")
+    else:
+        st.warning("⚠️ 目前正式知識庫內沒有資料，請先前往「手冊解析與校對」頁面存入內容。")
+    
+# --- 頁面三：獨立對話頁面 ---
+elif page == "AI對話機器人":
+    st.title("AI對話機器人")
+    
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"], unsafe_allow_html=True)
+
+    if prompt := st.chat_input("請問關於公司的規定..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):  
+            context = ""
+            current_k = st.session_state.get('dynamic_k', 5)
+            
+            if st.session_state.get('vector_db'):
+                context, scored_docs = get_relevant_context(
+                    prompt, 
+                    st.session_state['vector_db'], 
+                    current_k
+                )
+                
+                with st.expander(f"🔍 Hybrid Search + Rerank - Now K={current_k}"):
+                    for i, (score, d) in enumerate(scored_docs):
+                        st.write(f" 名次 {i+1} |  Rerank 得分: `{score:.4f}`")
+                        st.code(d.page_content)
+            else:
+                context = st.session_state.get('manual_context', "")
+
+            system_instruction = """你現在是一位專業的企業行政助手。
+            你的唯一任務是根據使用者提供的【手冊知識庫】回答每個問題。
+            【強制規則】：
+            1. 必須完全使用「繁體中文」（台灣習慣用語）回答。
+            2. 絕對禁止使用簡體中文。
+            3. 如果手冊中沒有答案，請禮貌地說找不到，不要編造。
+            4. 保持專業、客觀、準確。
+            5. 遇到打招呼（如：你好、早安），請用親切的語氣直接與使用者寒暄。
+            6. 遇到使用者輸入完全無意義的亂碼時，請禮貌地表達你聽不懂，並引導使用者詢問手冊相關問題。
+            """
+
+            full_prompt = f"【手冊內容】：\n{context}\n\n當前問題：{prompt}"
+            chat_messages = [
+                {'role': 'system', 'content': system_instruction},
+                {'role': 'user', 'content': full_prompt}
+            ]
+
+            try:
+                response = chat(
+                    model=target_model,
+                    messages=chat_messages,
+                    options={"temperature": 0.0, "num_predict": 2000}
+                )
+                answer = response.message.content
+            except Exception as e:
+                answer = f"連線失敗：{e}"
+
+        st.markdown(answer, unsafe_allow_html=True)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
