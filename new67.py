@@ -58,20 +58,14 @@ if 'manual_context' not in st.session_state:
     st.session_state['manual_context'] = ""
 if 'temp_text' not in st.session_state:
     st.session_state['temp_text'] = ""
-
 # 4. 側邊欄導覽選單
 with st.sidebar:
     st.markdown('<p class="sidebar-header">對話</p>', unsafe_allow_html=True)
     
-    menu_options = ["手冊解析與校對", "正式資料庫管理", "AI對話機器人"]
+    menu_options = ["手冊解析與校對", "正式資料庫管理", "AI對話機器人", "批次測試"]
     page_selection = st.radio("選單", options=menu_options, index=0)
     
-    if "手冊解析與校對" in page_selection:
-        page = "手冊解析與校對"
-    elif "正式資料庫管理" in page_selection:
-        page = "正式資料庫管理"
-    else:
-        page = "AI對話機器人"
+    page = page_selection
 
     st.divider()
     st.header("⚙️ 模型配置")
@@ -91,8 +85,10 @@ with st.sidebar:
         target_model = st.text_input("手動輸入模型", value="qwen2.5")
 
     st.subheader("⚙️ 檢索與重排配置")
-    retrieval_k = st.slider("最終提供給 AI 的片段數量 (K)", min_value=1, max_value=30, value=10, help="混合搜尋後經由 Rerank 篩選出的最終菁英片段數量。")
+    retrieval_k = st.slider("最終提供給 AI 的片段數量 (K)", min_value=1, max_value=30, value=15, help="混合搜尋後經由 Rerank 篩選出的最終菁英片段數量。")
     st.session_state['dynamic_k'] = retrieval_k
+    score_threshold = st.slider("Rerank 分數門檻", min_value=0.0, max_value=1.0, value=0.1, step=0.05, help="低於此分數的段落視為無相關內容")
+    st.session_state['score_threshold'] = score_threshold
 
     st.header("🧹 系統維護")
     if st.button("🗑️ 清除快取紀錄"):
@@ -100,7 +96,10 @@ with st.sidebar:
         st.cache_resource.clear()
         for key in list(st.session_state.keys()):
             del st.session_state[key]
-        st.toast("快取已完全清除！")
+        import shutil, os
+        if os.path.exists("faiss_index_storage"):
+            shutil.rmtree("faiss_index_storage")
+        st.toast("快取與知識庫已完全清除！")
         st.rerun()
 
 @st.cache_data
@@ -123,9 +122,9 @@ def clean_duplicated_text(text):
 # --- 1. 載入 Embedding 與 Reranker 模型 ---
 @st.cache_resource
 def get_embedding_model():
-    from langchain_huggingface import HuggingFaceEmbeddings  # ✅ 完全修正拼字
-    model_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    return HuggingFaceEmbeddings(model_name=model_name)      # ✅ 完全修正拼字
+    from langchain_huggingface import HuggingFaceEmbeddings
+    model_name = "BAAI/bge-m3"
+    return HuggingFaceEmbeddings(model_name=model_name, encode_kwargs={"normalize_embeddings": True})
 
 @st.cache_resource
 def get_reranker_model():
@@ -184,71 +183,81 @@ def _generate_summary_for_section(section_text: str, model_name: str) -> str:
         # 摘要失敗時，退回使用原文前 200 字作為索引
         return section_text[:200]
 
-def build_vector_store(docs, summarize_model: str = ""):
-    """
-    摘要索引建庫（Summary Index）：
-      1. 將原文切成語意完整的段落（原文單元）
-      2. 對每段呼叫 LLM 生成摘要（精華版）
-      3. 以摘要的 Embedding 建立 FAISS 向量索引
-      4. 同時保留「摘要 → 原文」的對照表（doc_id mapping）
-      5. 同步對摘要建立 BM25 關鍵字索引
+def _rewrite_query(query: str, history: list, model_name: str) -> str:
+    """把短問句結合對話歷史改寫成完整查詢，避免 RAG 搜尋時丟失上下文。"""
+    if not history:
+        return query
+    recent = history[-4:]  # 最近 2 輪
+    history_text = "\n".join(
+        f"{'用戶' if m['role'] == 'user' else '助手'}：{m['content'][:300]}"
+        for m in recent
+    )
+    rewrite_prompt = (
+        "根據以下對話歷史，把「當前問題」改寫成一個完整、不依賴對話歷史也能獨立理解的搜尋查詢。\n"
+        "只輸出改寫後的查詢，不要解釋，不要加任何前綴。\n\n"
+        f"對話歷史：\n{history_text}\n\n"
+        f"當前問題：{query}\n\n"
+        "改寫後的查詢："
+    )
+    try:
+        resp = chat(
+            model=model_name,
+            messages=[{"role": "user", "content": rewrite_prompt}],
+            options={"temperature": 0.0, "num_predict": 100},
+        )
+        return resp.message.content.strip() or query
+    except Exception:
+        return query
 
-    檢索時：搜尋摘要 → 取出對應原文 → 送給 LLM 回答
-    """
+def build_vector_store(docs, summarize_model: str = ""):
     from langchain_community.vectorstores import FAISS
     from langchain_community.retrievers import BM25Retriever
-    import uuid
+    import uuid, pickle, os
 
     global_meta_info = _detect_doc_meta(docs)
     sections = _split_into_sections(docs)
 
-    # 注入來源標籤到原文 metadata
     for sec in sections:
         sec.metadata["doc_context"] = global_meta_info if global_meta_info else "通用文本"
+        sec.metadata["doc_id"] = str(uuid.uuid4())
 
-    # 對每段生成摘要，並建立 doc_id 對照表
-    summary_docs = []   # 用於建立向量索引（內容=摘要）
-    id_to_full = {}     # doc_id → 原文 Document
-
-    total = len(sections)
-    progress_bar = st.progress(0, text="正在生成段落摘要索引...")
-
-    for i, sec in enumerate(sections):
-        doc_id = str(uuid.uuid4())
-
-        # 生成摘要
-        summary_text = _generate_summary_for_section(sec.page_content, summarize_model)
-        if global_meta_info:
-            summary_text = f"{global_meta_info}\n{summary_text}"
-
-        # 摘要 Document（帶 doc_id，用於向量庫）
-        summary_doc = Document(
-            page_content=summary_text,
-            metadata={**sec.metadata, "doc_id": doc_id, "source_type": "summary"},
+    # 加入一個專屬「文件資訊」chunk，讓「哪間公司」等 meta 查詢可以被搜尋到
+    if global_meta_info:
+        meta_id = str(uuid.uuid4())
+        meta_doc = Document(
+            page_content=f"本文件基本資訊：{global_meta_info}。本手冊為公司工作規則。",
+            metadata={"page": 0, "doc_id": meta_id, "doc_context": global_meta_info},
         )
-        summary_docs.append(summary_doc)
+        index_sections = [meta_doc] + sections
+    else:
+        index_sections = sections
 
-        # 原文 Document（帶 doc_id，用於回傳給 LLM）
-        sec.metadata["doc_id"] = doc_id
-        id_to_full[doc_id] = sec
+    id_to_full = {sec.metadata["doc_id"]: sec for sec in index_sections}
 
-        progress_bar.progress(
-            (i + 1) / total,
-            text=f"正在生成摘要索引… ({i+1}/{total})"
-        )
+    with st.spinner(f"正在建立向量庫（共 {len(sections)} 個段落）..."):
+        vector_db = FAISS.from_documents(index_sections, get_embedding_model())
+        try:
+            import jieba
+            bm25_retriever = BM25Retriever.from_documents(
+                index_sections,
+                preprocess_func=lambda text: list(jieba.cut(text)),
+            )
+        except ImportError:
+            bm25_retriever = BM25Retriever.from_documents(index_sections)
 
-    progress_bar.empty()
+        os.makedirs("faiss_index_storage", exist_ok=True)
+        vector_db.save_local("faiss_index_storage")
+        with open("faiss_index_storage/sections.pkl", "wb") as f:
+            pickle.dump(index_sections, f)
+        with open("faiss_index_storage/id_to_full.pkl", "wb") as f:
+            pickle.dump(id_to_full, f)
 
-    with st.spinner("正在建立 FAISS 摘要向量庫 + BM25 摘要關鍵字庫..."):
-        vector_db      = FAISS.from_documents(summary_docs, get_embedding_model())
-        bm25_retriever = BM25Retriever.from_documents(summary_docs)
-
-    st.success(f"✅ 摘要索引建庫完成！共 {total} 個段落，每段均有對應摘要。")
+    st.success(f"✅ 建庫完成！共 {len(sections)} 個段落。")
 
     return {
         "vector_db":      vector_db,
         "bm25_retriever": bm25_retriever,
-        "id_to_full":     id_to_full,      # 摘要 doc_id → 原文
+        "id_to_full":     id_to_full,
     }
 
 # --- 3. 摘要索引檢索：搜尋摘要 → 取出原文 → Rerank → 回傳 ---
@@ -266,9 +275,9 @@ def get_relevant_context(query, hybrid_db, k_value):
     bm25_retriever = hybrid_db["bm25_retriever"]
     id_to_full     = hybrid_db.get("id_to_full", {})
 
-    SCORE_THRESHOLD = 0.3   # Rerank 分數低於此值視為「知識庫無相關內容」
+    SCORE_THRESHOLD = st.session_state.get('score_threshold', 0.3)
 
-    candidate_k = max(k_value * 3, 15)
+    candidate_k = max(k_value * 3, 20)
 
     # 1. 搜尋摘要向量庫（Dense）
     dense_summary_docs = vector_db.similarity_search(query, k=candidate_k)
@@ -299,22 +308,97 @@ def get_relevant_context(query, hybrid_db, k_value):
     scored_docs = sorted(zip(scores, full_text_candidates), key=lambda x: x[0], reverse=True)
 
     # 5. Score Threshold：過濾低相關原文
-    top_k_scored = [
-        (score, doc) for score, doc in scored_docs[:k_value]
-        if score >= SCORE_THRESHOLD
-    ]
+    all_top_k = scored_docs[:k_value]
+    top_k_scored = [(score, doc) for score, doc in all_top_k if score >= SCORE_THRESHOLD]
+
+    # 供 Debug 視窗使用：保存全部排序結果（含被門檻過濾的）
+    st.session_state['_debug_all_scored'] = all_top_k
+    st.session_state['_debug_threshold']  = SCORE_THRESHOLD
+    st.session_state['_debug_candidates'] = len(full_text_candidates)
 
     if not top_k_scored:
         return "__NO_RELEVANT_CONTEXT__", []
 
     st.sidebar.caption(
-        f"⚡ 摘要索引檢索完成！"
-        f"初篩 {len(full_text_candidates)} 段原文 ➡️ Rerank 精選 {len(top_k_scored)} 段"
+        f"⚡ 檢索完成！初篩 {len(full_text_candidates)} 段 ➡️ 門檻通過 {len(top_k_scored)} 段"
     )
 
     final_docs   = [doc for _, doc in top_k_scored]
     context_text = "\n\n---\n\n".join([doc.page_content for doc in final_docs])
     return context_text, top_k_scored
+
+
+def get_rag_answer(question: str, model_name: str, k: int) -> tuple[str, str]:
+    """批次測試用：非串流版 RAG 問答，回傳 (answer, context_preview)。"""
+    hybrid_db = st.session_state.get('vector_db')
+    if not hybrid_db:
+        return "⚠️ 尚未建立知識庫", ""
+
+    context, scored_docs = get_relevant_context(question, hybrid_db, k)
+    if context == "__NO_RELEVANT_CONTEXT__":
+        return "📭 手冊中未找到相關內容", ""
+
+    context_preview = context[:300] + ("..." if len(context) > 300 else "")
+
+    system_instruction = (
+        "你現在是一位專業的企業行政助手。\n"
+        "你的唯一任務是根據使用者提供的【手冊內容】回答問題。\n\n"
+        "【強制規則】：\n"
+        "1. 只能從下方【手冊內容】中尋找答案，絕對不可使用手冊以外的任何知識。\n"
+        "2. 必須完全使用繁體中文（台灣習慣用語）回答。\n"
+        "3. 手冊中若找不到答案，請明確說「手冊中未提及此項目」，不要推測或編造。\n"
+        "4. 回答結尾必須附上【原文依據】，直接引用手冊中的相關句子。\n"
+        "5. 保持專業、客觀、準確。"
+    )
+    full_prompt = f"【手冊內容】：\n{context}\n\n當前問題：{question}"
+    try:
+        resp = chat(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": full_prompt},
+            ],
+            options={"temperature": 0.0, "num_predict": 2000},
+        )
+        return resp.message.content.strip(), context_preview
+    except Exception as e:
+        return f"連線失敗：{e}", context_preview
+
+
+# --- 4b. 啟動時從磁碟還原知識庫（須在函數定義後執行）---
+if 'vector_db' not in st.session_state:
+    import os, pickle
+    if os.path.exists("faiss_index_storage") and os.path.exists("faiss_index_storage/id_to_full.pkl"):
+        try:
+            from langchain_community.vectorstores import FAISS
+            from langchain_community.retrievers import BM25Retriever
+            _vdb = FAISS.load_local("faiss_index_storage", get_embedding_model(), allow_dangerous_deserialization=True)
+            _sections_path = "faiss_index_storage/sections.pkl"
+            _legacy_path   = "faiss_index_storage/summary_docs.pkl"
+            _src_path = _sections_path if os.path.exists(_sections_path) else _legacy_path
+            with open(_src_path, "rb") as f:
+                _sections = pickle.load(f)
+            with open("faiss_index_storage/id_to_full.pkl", "rb") as f:
+                _id_to_full = pickle.load(f)
+            try:
+                import jieba
+                _bm25 = BM25Retriever.from_documents(
+                    _sections,
+                    preprocess_func=lambda text: list(jieba.cut(text)),
+                )
+            except ImportError:
+                _bm25 = BM25Retriever.from_documents(_sections)
+            st.session_state['vector_db'] = {
+                "vector_db": _vdb,
+                "bm25_retriever": _bm25,
+                "id_to_full": _id_to_full,
+            }
+            ctx_path = "faiss_index_storage/manual_context.txt"
+            if os.path.exists(ctx_path):
+                with open(ctx_path, "r", encoding="utf-8") as f:
+                    st.session_state['manual_context'] = f.read()
+        except Exception:
+            pass
 
 
 # --- 5. 頁面邏輯切換 ---
@@ -337,7 +421,7 @@ if page == "手冊解析與校對":
                         t = p.extract_text()
                         if t:
                             clean_text = t.strip()
-                            documents.append(Document(page_content=clean_text, metadata={}))  
+                            documents.append(Document(page_content=clean_text, metadata={"page": i+1}))
                     st.session_state['temp_docs'] = documents 
                     st.session_state['text_area_input'] = "\n\n".join([doc.page_content for doc in documents])
                     st.success(f"解析成功！共 {len(reader.pages)} 頁。")
@@ -348,7 +432,7 @@ if page == "手冊解析與校對":
         if "test_notes" not in st.session_state:
             st.session_state.test_notes = df_test.assign(備註="")
 
-        edited_df = st.data_editor(
+        st.data_editor(
             st.session_state.test_notes,
             column_config={
                 "context": st.column_config.TextColumn("文章內容", width="medium"),
@@ -426,12 +510,15 @@ if page == "手冊解析與校對":
         final_text = st.session_state.get('text_area_input', "").strip()
         if final_text:
             with st.spinner("正在同步至正式資料庫..."):
-                final_docs = [Document(page_content=final_text, metadata={})]
+                # PDF 來源優先用 temp_docs（保留頁碼）；其他來源用純文字
+                final_docs = st.session_state.get('temp_docs') or [Document(page_content=final_text, metadata={})]
                 # 摘要索引模式：建立包含 FAISS、BM25、原文對照表的字典
                 st.session_state['vector_db'] = build_vector_store(final_docs, summarize_model=target_model)
-                # 儲存 FAISS 部分到本地端
-                st.session_state['vector_db']["vector_db"].save_local("faiss_index_storage")
                 st.session_state['manual_context'] = final_text
+                import os
+                os.makedirs("faiss_index_storage", exist_ok=True)
+                with open("faiss_index_storage/manual_context.txt", "w", encoding="utf-8") as f:
+                    f.write(final_text)
                 st.success(f"✅ 已建立摘要索引 RAG 資料庫 (共 {len(final_text)} 字)")
         
             st.rerun()
@@ -468,6 +555,10 @@ elif page == "正式資料庫管理":
                     st.session_state['manual_context'] = new_fixed_text
                     new_docs = [Document(page_content=new_fixed_text, metadata={"page": "修正版本"})]
                     st.session_state['vector_db'] = build_vector_store(new_docs, summarize_model=target_model)
+                    import os
+                    os.makedirs("faiss_index_storage", exist_ok=True)
+                    with open("faiss_index_storage/manual_context.txt", "w", encoding="utf-8") as f:
+                        f.write(new_fixed_text)
                     st.success(f"✅ 修正完成，已重新建立摘要索引 RAG 資料庫（共 {len(new_fixed_text)} 字）！")
                     st.balloons()
                     st.rerun()
@@ -489,60 +580,171 @@ elif page == "AI對話機器人":
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        with st.chat_message("assistant"):  
+        with st.chat_message("assistant"):
             context = ""
             current_k = st.session_state.get('dynamic_k', 5)
             scored_docs = []
-            
+            history_so_far = st.session_state.messages[:-1]  # 不含當前這輪
+
             # 獲取 RAG 背景資料（摘要索引檢索）
             if st.session_state.get('vector_db'):
+                # Query Rewriting：把短問句結合歷史改寫成完整查詢，解決上下文斷鏈問題
+                search_query = _rewrite_query(prompt, history_so_far, target_model)
+                if search_query != prompt:
+                    st.caption(f"🔄 查詢改寫：{search_query}")
+
                 context, scored_docs = get_relevant_context(
-                    prompt, 
-                    st.session_state['vector_db'], 
+                    search_query,
+                    st.session_state['vector_db'],
                     current_k
                 )
-                
-                # --- Debug 展開視窗 ---
-                with st.expander(f"🔍 摘要索引檢索 + Rerank 最終精選原文 (Debug) - 目前 K={current_k}"):
-                    if context == "__NO_RELEVANT_CONTEXT__":
-                        st.warning("⚠️ 所有候選段落的 Rerank 分數均低於門檻，知識庫中找不到相關內容。")
-                    else:
-                        for i, (score, d) in enumerate(scored_docs):
-                            st.write(f"🥇 名次 {i+1} | 🎯 Rerank 得分: `{score:.4f}`")
-                            st.code(d.page_content)
-            else:
-                context = st.session_state.get('manual_context', "")
 
-            # Score Threshold 攔截：知識庫無相關內容，直接回覆，不進 LLM
-            if context == "__NO_RELEVANT_CONTEXT__":
+                # --- Debug 展開視窗 ---
+                all_scored = st.session_state.get('_debug_all_scored', [])
+                threshold  = st.session_state.get('_debug_threshold', 0.3)
+                n_cands    = st.session_state.get('_debug_candidates', 0)
+                with st.expander(f"🔍 Rerank 全部排名（候選 {n_cands} 段，門檻 {threshold:.2f}）- K={current_k}"):
+                    if not all_scored:
+                        st.warning("⚠️ 無候選段落。")
+                    else:
+                        for i, (score, d) in enumerate(all_scored):
+                            page   = d.metadata.get('page', '?')
+                            passed = score >= threshold
+                            icon   = "✅" if passed else "❌"
+                            st.write(f"{icon} 名次 {i+1} | 分數 `{score:.4f}` | 📄 第 {page} 頁")
+                            st.code(d.page_content[:300])
+
+            # 無 RAG 庫：拒絕回答，避免 LLM 憑空捏造
+            if not st.session_state.get('vector_db'):
+                answer = "⚠️ 尚未建立知識庫，請先至「手冊解析與校對」頁面上傳文件並存入知識庫。"
+                st.markdown(answer, unsafe_allow_html=True)
+            # Rerank 門檻攔截：知識庫無相關內容
+            elif context == "__NO_RELEVANT_CONTEXT__":
                 answer = "📭 手冊中未找到與此問題相關的內容，建議洽詢相關部門或換個關鍵字再試。"
+                st.markdown(answer, unsafe_allow_html=True)
             else:
-                system_instruction = """你現在是一位專業的企業行政助手。
-                你的唯一任務是根據使用者提供的【手冊知識庫】回答每個問題。
-                【強制規則】：
-                1. 必須完全使用「繁體中文」（台灣習慣用語）回答。
-                2. 絕對禁止使用簡體中文。
-                3. 如果手冊中沒有答案，請禮貌地說找不到，不要編造。
-                4. 保持專業、客觀、準確。
-                5. 遇到打招呼（如：你好、早安），請用親切的語氣直接與使用者寒暄。
-                6. 遇到使用者輸入完全無意義的亂碼時，請禮貌地表達你聽不懂，並引導使用者詢問手冊相關問題。
-                """
+                system_instruction = (
+                    "你現在是一位專業的企業行政助手。\n"
+                    "你的唯一任務是根據使用者提供的【手冊內容】回答問題。\n\n"
+                    "【強制規則】：\n"
+                    "1. 只能從下方【手冊內容】中尋找答案，絕對不可使用手冊以外的任何知識。\n"
+                    "2. 必須完全使用繁體中文（台灣習慣用語）回答。\n"
+                    "3. 手冊中若找不到答案，請明確說「手冊中未提及此項目」，不要推測或編造。\n"
+                    "4. 回答結尾必須附上【原文依據】，直接引用手冊中的相關句子。\n"
+                    "5. 保持專業、客觀、準確。\n"
+                    "6. 遇到打招呼，請親切回應，無需引用手冊。\n"
+                    "7. 遇到無意義亂碼，請禮貌說明並引導詢問手冊相關問題。"
+                )
 
                 full_prompt = f"【手冊內容】：\n{context}\n\n當前問題：{prompt}"
-                chat_messages = [
-                    {'role': 'system', 'content': system_instruction},
-                    {'role': 'user', 'content': full_prompt}
-                ]
+                # 歷史僅保留最近 3 輪（6 條），避免幻覺累積與 context 超長
+                chat_messages = [{'role': 'system', 'content': system_instruction}]
+                for msg in history_so_far[-6:]:
+                    chat_messages.append({'role': msg['role'], 'content': msg['content']})
+                chat_messages.append({'role': 'user', 'content': full_prompt})
 
+                placeholder = st.empty()
+                answer = ""
                 try:
-                    response = chat(
+                    for chunk in chat(
                         model=target_model,
                         messages=chat_messages,
-                        options={"temperature": 0.0, "num_predict": 2000}
-                    )
-                    answer = response.message.content
+                        stream=True,
+                        options={"temperature": 0.0, "num_predict": 2000},
+                    ):
+                        answer += chunk.message.content
+                        placeholder.markdown(answer)
                 except Exception as e:
                     answer = f"連線失敗：{e}"
+                    placeholder.markdown(answer)
 
-        st.markdown(answer, unsafe_allow_html=True)
         st.session_state.messages.append({"role": "assistant", "content": answer})
+
+# --- 頁面四：批次測試 ---
+elif page == "批次測試":
+    st.title("🧪 批次測試")
+
+    try:
+        from test_data import HALLUCINATION_TESTS, RAG_TESTS
+    except ImportError:
+        st.error("❌ 找不到 test_data.py，請確認該檔案與 new67.py 在同一目錄。")
+        st.stop()
+
+    if not st.session_state.get('vector_db'):
+        st.warning("⚠️ 尚未建立知識庫，請先至「手冊解析與校對」頁面上傳文件並存入知識庫。")
+        st.stop()
+
+    test_set_choice = st.radio(
+        "選擇測試集",
+        ["幻覺測試 (10題)", "RAG 完整測試 (30題)", "全部 (40題)"],
+        horizontal=True,
+    )
+
+    if test_set_choice == "幻覺測試 (10題)":
+        selected_tests = HALLUCINATION_TESTS
+    elif test_set_choice == "RAG 完整測試 (30題)":
+        selected_tests = RAG_TESTS
+    else:
+        selected_tests = HALLUCINATION_TESTS + RAG_TESTS
+
+    st.info(f"共 **{len(selected_tests)}** 題，使用模型：`{target_model}`，K={retrieval_k}")
+
+    with st.expander("📋 預覽題目列表", expanded=False):
+        preview_rows = [
+            {"題號": t["題號"], "問題": t["問題"], "預期答案": t["預期答案"]}
+            for t in selected_tests
+        ]
+        st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+    if st.button("🚀 開始批次測試", type="primary"):
+        results = []
+        progress_bar = st.progress(0, text="準備開始...")
+        status_text  = st.empty()
+
+        for idx, test in enumerate(selected_tests):
+            question = test["問題"]
+            expected = test["預期答案"]
+            status_text.text(f"正在測試第 {idx + 1}/{len(selected_tests)} 題：{question[:40]}...")
+
+            answer, ctx_preview = get_rag_answer(question, target_model, retrieval_k)
+
+            results.append({
+                "題號":   test["題號"],
+                "問題":   question,
+                "系統回答": answer,
+                "預期答案": expected,
+                "檢索預覽": ctx_preview,
+            })
+            progress_bar.progress((idx + 1) / len(selected_tests), text=f"{idx + 1}/{len(selected_tests)} 完成")
+
+        status_text.success(f"✅ 全部 {len(results)} 題測試完成！")
+        st.session_state['_batch_results'] = results
+
+    if st.session_state.get('_batch_results'):
+        results = st.session_state['_batch_results']
+        st.divider()
+        st.subheader(f"📊 測試結果（共 {len(results)} 題）")
+
+        for r in results:
+            with st.expander(f"題號 {r['題號']}：{r['問題'][:50]}"):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown("**🤖 系統回答**")
+                    st.write(r["系統回答"])
+                with col_b:
+                    st.markdown("**✅ 預期答案**")
+                    st.write(r["預期答案"])
+                if r["檢索預覽"]:
+                    st.caption(f"檢索片段預覽：{r['檢索預覽']}")
+
+        df_results = pd.DataFrame([
+            {"題號": r["題號"], "問題": r["問題"], "系統回答": r["系統回答"], "預期答案": r["預期答案"]}
+            for r in results
+        ])
+        csv_data = df_results.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            label="⬇️ 下載結果 CSV",
+            data=csv_data,
+            file_name="batch_test_results.csv",
+            mime="text/csv",
+        )
