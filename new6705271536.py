@@ -59,6 +59,10 @@ if 'manual_context' not in st.session_state:
     st.session_state['manual_context'] = ""
 if 'temp_text' not in st.session_state:
     st.session_state['temp_text'] = ""
+if 'is_processing' not in st.session_state:
+    st.session_state['is_processing'] = False
+if 'pending_question' not in st.session_state:
+    st.session_state['pending_question'] = None
 # 4. 側邊欄導覽選單
 with st.sidebar:
     st.markdown('<p class="sidebar-header">對話</p>', unsafe_allow_html=True)
@@ -647,9 +651,14 @@ elif page == "AI對話機器人(五方-工作規則)":
             st.markdown(msg["content"], unsafe_allow_html=True)
 
     if prompt := st.chat_input("請問關於公司的規定..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        if not st.session_state.get('is_processing', False):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            st.session_state['pending_question'] = prompt
+            st.session_state['is_processing'] = True
+            st.rerun()
+
+    if st.session_state.get('is_processing') and st.session_state.get('pending_question'):
+        prompt = st.session_state['pending_question']
 
         with st.chat_message("assistant"):
             context = ""
@@ -679,13 +688,14 @@ elif page == "AI對話機器人(五方-工作規則)":
                         st.warning("⚠️ 無候選段落。")
                     else:
                         for i, (score, d) in enumerate(all_scored):
-                            page   = d.metadata.get('page', '?')
+                            page_num = d.metadata.get('page', '?')
                             passed = score >= threshold
                             icon   = "✅" if passed else "❌"
-                            st.write(f"{icon} 名次 {i+1} | 分數 `{score:.4f}` | 📄 第 {page} 頁")
+                            st.write(f"{icon} 名次 {i+1} | 分數 `{score:.4f}` | 📄 第 {page_num} 頁")
                             st.code(d.page_content[:300])
 
             # 無 RAG 庫：拒絕回答，避免 LLM 憑空捏造
+            answer = ""
             if not st.session_state.get('vector_db'):
                 answer = "⚠️ 尚未建立知識庫，請先至「手冊解析與校對」頁面上傳文件並存入知識庫。"
                 st.markdown(answer, unsafe_allow_html=True)
@@ -716,8 +726,7 @@ elif page == "AI對話機器人(五方-工作規則)":
                 for msg in history_so_far[-6:]:
                     chat_messages.append({'role': msg['role'], 'content': msg['content']})
                 chat_messages.append({'role': 'user', 'content': full_prompt})
-                
-                
+
                 placeholder = st.empty()
                 answer = ""
                 try:
@@ -734,6 +743,9 @@ elif page == "AI對話機器人(五方-工作規則)":
                     placeholder.markdown(answer)
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.session_state['is_processing'] = False
+        st.session_state['pending_question'] = None
+        st.rerun()
 
 # --- 頁面四：批次測試 ---
 elif page == "批次測試":
