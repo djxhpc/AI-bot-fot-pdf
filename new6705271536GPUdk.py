@@ -69,7 +69,7 @@ with st.sidebar:
     
     # menu_options = ["手冊解析與校對", "正式資料庫管理", "AI對話機器人", "批次測試", "分塊評估"]
     # menu_options = ["手冊解析與校對", "正式資料庫管理", "AI對話機器人"]
-    menu_options = ["AI對話機器人(五方-工作規則)","手冊解析與校對"]
+    menu_options = ["AI對話機器人(五方-工作規則)"]
     page_selection = st.radio("選單", options=menu_options, index=0)
     
     page = page_selection
@@ -90,15 +90,17 @@ with st.sidebar:
     # except Exception as e:
     #     st.error(f"連線失敗：{e}")
     #     target_model = st.text_input("手動輸入模型", value="qwen2.5")
-    target_model = "ycchen/breeze-7b-instruct-v1_0:latest"
+    # target_model = "ycchen/breeze-7b-instruct-v1_0:latest"
+    # target_model = "cwchang/llama-3-taiwan-8b-instruct"
+    target_model = "kenneth85/llama-3-taiwan:8b-instruct-dpo-q6_K"
 
     # # st.subheader("⚙️ 檢索與重排配置")
     # retrieval_k = st.slider("最終提供給 AI 的片段數量 (K)", min_value=1, max_value=30, value=15, help="混合搜尋後經由 Rerank 篩選出的最終菁英片段數量。")
     # st.session_state['dynamic_k'] = retrieval_k
     # score_threshold = st.slider("Rerank 分數門檻", min_value=0.0, max_value=1.0, value=0.1, step=0.05, help="低於此分數的段落視為無相關內容")
     # st.session_state['score_threshold'] = score_threshold
-    st.session_state['dynamic_k'] = 10
-    st.session_state['score_threshold'] = 0.2
+    st.session_state['dynamic_k'] = 15
+    st.session_state['score_threshold'] = 0.05
 
     # st.header("🧹 系統維護")
     # if st.button("🗑️ 清除快取紀錄"):
@@ -130,21 +132,33 @@ def clean_duplicated_text(text):
     return text.strip()
 
 # --- 1. 載入 Embedding 與 Reranker 模型 ---
+import os
+import streamlit as st
+import torch
+
+# 定義模型路徑（優先看本地資料夾是否存在）
+EMBEDDING_PATH = "./models/bge-m3" if os.path.exists("./models/bge-m3") else "BAAI/bge-m3"
+RERANKER_PATH = "./models/bge-reranker-v2-m3" if os.path.exists("./models/bge-reranker-v2-m3") else "BAAI/bge-reranker-v2-m3"
+
 @st.cache_resource
 def get_embedding_model():
-    import torch
     from langchain_huggingface import HuggingFaceEmbeddings
-    model_name = "BAAI/bge-m3"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    return HuggingFaceEmbeddings(model_name=model_name, model_kwargs={"device": device}, encode_kwargs={"normalize_embeddings": True})
+    
+    # model_name 可以直接傳入本地資料夾路徑
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_PATH, 
+        model_kwargs={"device": device}, 
+        encode_kwargs={"normalize_embeddings": True}
+    )
 
 @st.cache_resource
 def get_reranker_model():
-    import torch
     from sentence_transformers import CrossEncoder
-    model_name = "BAAI/bge-reranker-v2-m3"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    return CrossEncoder(model_name, device=device)
+    
+    # model_name 可以直接傳入本地資料夾路徑
+    return CrossEncoder(RERANKER_PATH, device=device)
 
 # --- 2. 摘要索引建庫（Summary Index + MultiVector Retriever）---
 def _detect_doc_meta(docs):
@@ -169,29 +183,12 @@ def _split_into_sections(docs):
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=200, #200
-        chunk_overlap=40, #40
+        chunk_overlap=20, #40
         length_function=len,
         separators=["\n\n", "\n", "。", "；", " ", ""],
     )
     return splitter.split_documents(docs)
 
-# def _split_into_sections(docs):
-#     """
-#     使用基於標點符號的 Recursive 方式模擬句子切分。
-#     移除終極切分符 ""，確保絕對不會在句子中間被硬生生截斷。
-#     """
-#     from langchain_text_splitters import RecursiveCharacterTextSplitter
-    
-#     # 調整 separators：优先依據段落、再來是傳統中文的完整句尾標點
-#     # 移除原有的 ""，避免在字詞中間被切斷
-#     splitter = RecursiveCharacterTextSplitter(
-#         chunk_size=600,       # 這裡的 600 字變成是「上限」，通常會在接近 600 字的最後一個句號切斷
-#         chunk_overlap=80,     # 保留重疊句，維持上下文感
-#         length_function=len,
-#         separators=["\n\n", "\n", "。", "！", "？", "；", " "], 
-#         keep_separator=True   # 建議設為 True，保留句尾的句號或驚嘆號
-#     )
-#     return splitter.split_documents(docs)
 
 
 def _generate_summary_for_section(section_text: str, model_name: str) -> str:
@@ -309,8 +306,9 @@ def get_relevant_context(query, hybrid_db, k_value):
 
     SCORE_THRESHOLD = st.session_state.get('score_threshold', 0.1)
 
-    candidate_k = max(k_value * 2, 15)
-    # candidate_k = max(k_value * 3, 20)
+    # candidate_k = max(k_value * 2, 15)
+    candidate_k = max(k_value * 3, 20)
+    
 
     # 1. 搜尋摘要向量庫（Dense）
     dense_summary_docs = vector_db.similarity_search(query, k=candidate_k)
@@ -405,6 +403,7 @@ def get_rag_answer(question: str, model_name: str, k: int) -> tuple[str, str]:
         "例如：手冊列舉的解僱事由不包含某行為，就必須回答「手冊未列此情況，無法適用」，不得猜測該行為是否符合某條款。\n"
         "7. 【禁止擴大解釋】：若條文明確限定條件（如『連休3日以上』），不得將該規定套用到條件以外的情況。"
     )
+
 
     
 
@@ -685,7 +684,7 @@ elif page == "AI對話機器人(五方-工作規則)":
 
                 # --- Debug 展開視窗 ---
                 all_scored = st.session_state.get('_debug_all_scored', [])
-                threshold  = st.session_state.get('_debug_threshold', 0.3)
+                threshold  = st.session_state.get('_debug_threshold', 0.05)#Rerank 門檻攔截條越低越鬆
                 n_cands    = st.session_state.get('_debug_candidates', 0)
                 with st.expander(f"🔍 Rerank 全部排名（候選 {n_cands} 段，門檻 {threshold:.2f}）- K={current_k}"):
                     if not all_scored:
