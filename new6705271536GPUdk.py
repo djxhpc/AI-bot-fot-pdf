@@ -3,7 +3,6 @@ import streamlit as st
 from ollama import chat
 from pypdf import PdfReader
 import ollama
-from datasets import load_dataset
 import pandas as pd
 import re
 from langchain_core.documents import Document
@@ -69,7 +68,7 @@ with st.sidebar:
     
     # menu_options = ["手冊解析與校對", "正式資料庫管理", "AI對話機器人", "批次測試", "分塊評估"]
     # menu_options = ["手冊解析與校對", "正式資料庫管理", "AI對話機器人"]
-    menu_options = ["AI對話機器人(五方-工作規則)"]
+    menu_options = ["AI對話機器人(五方-工作規則)", "ISMS 文件管理","手冊解析與校對", "正式資料庫管理"]
     page_selection = st.radio("選單", options=menu_options, index=0)
     
     page = page_selection
@@ -102,22 +101,7 @@ with st.sidebar:
     st.session_state['dynamic_k'] = 15
     st.session_state['score_threshold'] = 0.05
 
-    # st.header("🧹 系統維護")
-    # if st.button("🗑️ 清除快取紀錄"):
-    #     st.cache_data.clear()
-    #     st.cache_resource.clear()
-    #     for key in list(st.session_state.keys()):
-    #         del st.session_state[key]
-    #     import shutil, os
-    #     if os.path.exists("faiss_index_storage"):
-    #         shutil.rmtree("faiss_index_storage")
-    #     st.toast("快取與知識庫已完全清除！")
-    #     st.rerun()
 
-@st.cache_data
-def get_test_dataset():
-    dataset = load_dataset("MediaTek-Research/TCEval-v2", "drcd", split='test')
-    return pd.DataFrame(dataset)
 
 def clean_duplicated_text(text):
     if not text:
@@ -212,9 +196,18 @@ def _generate_summary_for_section(section_text: str, model_name: str) -> str:
         # 摘要失敗時，退回使用原文前 200 字作為索引
         return section_text[:200]
 
+_COREFERENCE_WORDS = [
+    "這個", "那個", "它", "他", "她", "這裡", "那裡", "這樣", "那樣",
+    "上面", "前面", "剛才", "之前", "這條", "那條", "這項", "那項",
+    "此", "該", "其", "如此", "這種", "那種", "還有", "另外", "也是",
+]
+
 def _rewrite_query(query: str, history: list, model_name: str) -> str:
     """把短問句結合對話歷史改寫成完整查詢，避免 RAG 搜尋時丟失上下文。"""
     if not history:
+        return query
+    # 問題本身沒有指涉前文的代詞/指示詞，直接回傳原問題，避免帶入無關歷史
+    if not any(w in query for w in _COREFERENCE_WORDS):
         return query
     recent = history[-4:]  # 最近 2 輪
     history_text = "\n".join(
@@ -289,8 +282,143 @@ def build_vector_store(docs, summarize_model: str = ""):
         "id_to_full":     id_to_full,
     }
 
+def _hyde_expand(query: str, model_name: str) -> str:
+    """HyDE：讓 LLM 生成假答案，用假答案向量語意取代短問句去搜尋，提升召回精準度。"""
+    prompt = (
+        "請根據以下問題，假設你已知答案，用繁體中文寫出一段可能出現在公司工作規則手冊裡的對應條文內容。"
+        "只輸出條文內容，不要解釋，不要加前綴：\n\n"
+        f"問題：{query}"
+    )
+    try:
+        resp = chat(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.0, "num_predict": 150},
+        )
+        expanded = resp.message.content.strip()
+        # 合併原問題 + 假答案，讓 BM25 也能受益
+        return f"{query} {expanded}" if expanded else query
+    except Exception:
+        return query
+
+# --- ISMS 分庫：獨立 chunk 設定與建庫 ---
+ISMS_INDEX_PATH = "faiss_index_storage/isms"
+
+def _split_into_isms_sections(docs):
+    """ISMS 文件切割：程序書/控制項說明較長，使用 500/100 確保語意完整。"""
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=100,
+        length_function=len,
+        separators=["\n\n", "\n", "。", "；", " ", ""],
+    )
+    return splitter.split_documents(docs)
+
+def build_isms_store(docs):
+    from langchain_community.vectorstores import FAISS
+    from langchain_community.retrievers import BM25Retriever
+    import uuid, pickle, os
+
+    global_meta_info = _detect_doc_meta(docs)
+    sections = _split_into_isms_sections(docs)
+
+    for sec in sections:
+        sec.metadata["doc_context"] = global_meta_info if global_meta_info else "ISMS文件"
+        sec.metadata["doc_id"] = str(uuid.uuid4())
+
+    if global_meta_info:
+        meta_doc = Document(
+            page_content=f"本文件基本資訊：{global_meta_info}。本文件為 ISMS 資訊安全管理系統相關文件。",
+            metadata={"page": 0, "doc_id": str(uuid.uuid4()), "doc_context": global_meta_info},
+        )
+        index_sections = [meta_doc] + sections
+    else:
+        index_sections = sections
+
+    id_to_full = {sec.metadata["doc_id"]: sec for sec in index_sections}
+
+    with st.spinner(f"正在建立 ISMS 向量庫（共 {len(sections)} 個段落）..."):
+        vector_db = FAISS.from_documents(index_sections, get_embedding_model())
+        try:
+            import jieba
+            bm25_retriever = BM25Retriever.from_documents(
+                index_sections,
+                preprocess_func=lambda text: list(jieba.cut(text)),
+            )
+        except ImportError:
+            bm25_retriever = BM25Retriever.from_documents(index_sections)
+
+        os.makedirs(ISMS_INDEX_PATH, exist_ok=True)
+        vector_db.save_local(ISMS_INDEX_PATH)
+        with open(f"{ISMS_INDEX_PATH}/sections.pkl", "wb") as f:
+            pickle.dump(index_sections, f)
+        with open(f"{ISMS_INDEX_PATH}/id_to_full.pkl", "wb") as f:
+            pickle.dump(id_to_full, f)
+
+    st.success(f"✅ ISMS 建庫完成！共 {len(sections)} 個段落。")
+    return {
+        "vector_db":      vector_db,
+        "bm25_retriever": bm25_retriever,
+        "id_to_full":     id_to_full,
+    }
+
+# --- 查詢路由：判斷問題屬於工作規則還是 ISMS ---
+_WORK_RULES_KEYWORDS = [
+    "請假", "特休", "病假", "事假", "薪資", "出勤", "工時", "加班", "獎懲",
+    "福利", "職務", "解僱", "試用", "升遷", "調薪", "曠職", "遲到", "早退",
+    "產假", "陪產", "育嬰", "喪假", "公假", "補休", "值班", "工作規則",
+]
+_ISMS_KEYWORDS = [
+    "資安", "資訊安全", "ISMS", "ISO", "存取", "存取控制", "風險", "資產",
+    "稽核", "事件", "弱點", "備份", "加密", "權限", "政策", "程序書",
+    "作業程序", "資訊系統", "帳號", "密碼", "防火牆", "資料外洩", "控制項",
+    "安全管理", "資安事件", "變更管理", "營運持續",
+]
+
+def _route_query(query: str) -> str:
+    """回傳 'work_rules' | 'isms' | 'both'"""
+    has_work  = any(kw in query for kw in _WORK_RULES_KEYWORDS)
+    has_isms  = any(kw in query for kw in _ISMS_KEYWORDS)
+    if has_work and not has_isms:
+        return "work_rules"
+    if has_isms and not has_work:
+        return "isms"
+    return "both"  # 不確定或兩邊都有 → 全搜後 rerank 決定
+
+def get_routed_context(query: str, k: int, model_name: str = "") -> tuple[str, list]:
+    """路由後搜尋，自動選庫或合併兩庫結果。"""
+    work_db = st.session_state.get('vector_db')
+    isms_db = st.session_state.get('isms_db')
+    route   = _route_query(query)
+
+    def _search(db):
+        return get_relevant_context(query, db, k, model_name)
+
+    if route == "work_rules":
+        return _search(work_db) if work_db else ("__NO_RELEVANT_CONTEXT__", [])
+    if route == "isms":
+        return _search(isms_db) if isms_db else ("__NO_RELEVANT_CONTEXT__", [])
+
+    # route == "both"：兩庫都搜，合併後重新排序取 top-k
+    combined = []
+    for db in [work_db, isms_db]:
+        if not db:
+            continue
+        ctx, scored = _search(db)
+        if ctx != "__NO_RELEVANT_CONTEXT__":
+            combined.extend(scored)
+
+    if not combined:
+        return "__NO_RELEVANT_CONTEXT__", []
+
+    combined.sort(key=lambda x: x[0], reverse=True)
+    top = combined[:k]
+    context_text = "\n\n---\n\n".join([doc.page_content for _, doc in top])
+    return context_text, top
+
 # --- 3. 摘要索引檢索：搜尋摘要 → 取出原文 → Rerank → 回傳 ---
-def get_relevant_context(query, hybrid_db, k_value):
+def get_relevant_context(query, hybrid_db, k_value, model_name: str = ""):
     """
     檢索流程：
       1. FAISS 搜尋摘要向量庫（Dense）
@@ -308,14 +436,16 @@ def get_relevant_context(query, hybrid_db, k_value):
 
     # candidate_k = max(k_value * 2, 15)
     candidate_k = max(k_value * 3, 20)
-    
+
+    # HyDE：短問句（15字以內）先生成假答案擴展搜尋語意
+    search_query = _hyde_expand(query, model_name) if model_name and len(query) <= 15 else query
 
     # 1. 搜尋摘要向量庫（Dense）
-    dense_summary_docs = vector_db.similarity_search(query, k=candidate_k)
+    dense_summary_docs = vector_db.similarity_search(search_query, k=candidate_k)
 
     # 2. 搜尋摘要 BM25 庫（Sparse）
     bm25_retriever.k = candidate_k
-    sparse_summary_docs = bm25_retriever.invoke(query)
+    sparse_summary_docs = bm25_retriever.invoke(search_query)
 
     # 3. 去重（以 doc_id 為準），並取出對應原文
     seen_ids = set()
@@ -461,100 +591,60 @@ if 'vector_db' not in st.session_state:
             pass
 
 
+# --- 4c. 啟動時還原 ISMS 庫 ---
+if 'isms_db' not in st.session_state:
+    import os, pickle
+    _isms_id_path = f"{ISMS_INDEX_PATH}/id_to_full.pkl"
+    if os.path.exists(ISMS_INDEX_PATH) and os.path.exists(_isms_id_path):
+        try:
+            from langchain_community.vectorstores import FAISS
+            from langchain_community.retrievers import BM25Retriever
+            _i_vdb = FAISS.load_local(ISMS_INDEX_PATH, get_embedding_model(), allow_dangerous_deserialization=True)
+            with open(f"{ISMS_INDEX_PATH}/sections.pkl", "rb") as f:
+                _i_sections = pickle.load(f)
+            with open(_isms_id_path, "rb") as f:
+                _i_id_to_full = pickle.load(f)
+            try:
+                import jieba
+                _i_bm25 = BM25Retriever.from_documents(
+                    _i_sections,
+                    preprocess_func=lambda text: list(jieba.cut(text)),
+                )
+            except ImportError:
+                _i_bm25 = BM25Retriever.from_documents(_i_sections)
+            st.session_state['isms_db'] = {
+                "vector_db":      _i_vdb,
+                "bm25_retriever": _i_bm25,
+                "id_to_full":     _i_id_to_full,
+            }
+        except Exception:
+            pass
+
 # --- 5. 頁面邏輯切換 ---
 
 # --- 頁面一：手冊解析 ---
 if page == "手冊解析與校對":
     st.title("📄 知識庫管理")
-    # tab_manual, tab_testset = st.tabs(["📁 上傳手冊 (PDF)", "🧪 測試資料集 (DRCD)"])
-    tab_manual = st.tabs(["📁 上傳手冊 (PDF)"])
+    (tab_manual,) = st.tabs(["📁 上傳手冊 (PDF)"])
 
-    # with tab_manual:
-    #     st.subheader("PDF 手冊解析")
-    #     uploaded_file = st.file_uploader("選擇 PDF 文件", type="pdf", key="manual_uploader")
+    with tab_manual:
+        st.subheader("PDF 手冊解析")
+        uploaded_file = st.file_uploader("選擇 PDF 文件", type="pdf", key="manual_uploader")
         
-    #     if uploaded_file:
-    #         if st.button("🔍 開始提取文本"):
-    #             with st.spinner("正在讀取 PDF..."):
-    #                 reader = PdfReader(uploaded_file)
-    #                 documents = []
-    #                 for i, p in enumerate(reader.pages):
-    #                     t = p.extract_text()
-    #                     if t:
-    #                         clean_text = t.strip()
-    #                         documents.append(Document(page_content=clean_text, metadata={"page": i+1}))
-    #                 st.session_state['temp_docs'] = documents 
-    #                 st.session_state['text_area_input'] = "\n\n".join([doc.page_content for doc in documents])
-    #                 st.success(f"解析成功！共 {len(reader.pages)} 頁。")
+        if uploaded_file:
+            if st.button("🔍 開始提取文本"):
+                with st.spinner("正在讀取 PDF..."):
+                    reader = PdfReader(uploaded_file)
+                    documents = []
+                    for i, p in enumerate(reader.pages):
+                        t = p.extract_text()
+                        if t:
+                            clean_text = t.strip()
+                            documents.append(Document(page_content=clean_text, metadata={"page": i+1}))
+                    st.session_state['temp_docs'] = documents 
+                    st.session_state['text_area_input'] = "\n\n".join([doc.page_content for doc in documents])
+                    st.success(f"解析成功！共 {len(reader.pages)} 頁。")
 
-    st.subheader("PDF 手冊解析")
-    uploaded_file = st.file_uploader("選擇 PDF 文件", type="pdf", key="manual_uploader")
-    
-    if uploaded_file:
-        if st.button("🔍 開始提取文本"):
-            with st.spinner("正在讀取 PDF..."):
-                reader = PdfReader(uploaded_file)
-                documents = []
-                for i, p in enumerate(reader.pages):
-                    t = p.extract_text()
-                    if t:
-                        clean_text = t.strip()
-                        documents.append(Document(page_content=clean_text, metadata={"page": i+1}))
-                st.session_state['temp_docs'] = documents 
-                st.session_state['text_area_input'] = "\n\n".join([doc.page_content for doc in documents])
-                st.success(f"解析成功！共 {len(reader.pages)} 頁。")
-
-    # with tab_testset:
-    #     st.subheader("MediaTek-Research TCEval-v2")
-    #     df_test = get_test_dataset()
-    #     if "test_notes" not in st.session_state:
-    #         st.session_state.test_notes = df_test.assign(備註="")
-
-    #     st.data_editor(
-    #         st.session_state.test_notes,
-    #         column_config={
-    #             "context": st.column_config.TextColumn("文章內容", width="medium"),
-    #             "question": "問題",
-    #             "answers": "標準答案",
-    #             "備註": st.column_config.TextColumn("我的註解", help="雙擊即可編輯筆記")
-    #         },
-    #         disabled=["context", "question", "answers"],
-    #         hide_index=True,
-    #         height=300,
-    #         key="data_editor_test"
-    #     )
-    #     st.divider()
-    #     st.subheader("🚀 知識庫批量導入")
-    #     col1, col2 = st.columns(2)
-        
-    #     with col1:
-    #         selected_row = st.selectbox("選擇單一資料導入：", range(len(df_test)))
-    #         if st.button("單筆導入"):
-    #             target_data = df_test.iloc[selected_row]
-    #             possible_keys = ['context', 'paragraph', 'text', 'content']
-    #             found_content = next((target_data[k] for k in possible_keys if k in target_data), "")
-    #             if found_content:
-    #                 st.session_state['temp_text'] = found_content
-    #                 st.session_state['manual_context'] = found_content
-    #                 st.success(f"✅ 已導入第 {selected_row} 筆！")
-    #                 st.rerun()
-
-    #     with col2:
-    #         st.write("一次導入整份資料集")
-    #         if st.button("🔥 全部導入 (批次模式)"):
-    #             with st.spinner("正在合併所有資料內容..."):
-    #                 possible_keys = ['context', 'paragraph', 'text', 'content']
-    #                 found_key = next((k for k in df_test.columns if k in possible_keys), None)
-    #                 if found_key:
-    #                     all_contexts = df_test[found_key].drop_duplicates().tolist()
-    #                     combined_text = "\n\n--- 資料邊界 ---\n\n".join(all_contexts)
-    #                     st.session_state['temp_text'] = combined_text
-    #                     st.session_state['manual_context'] = combined_text
-    #                     st.session_state['text_area_input'] = combined_text
-    #                     st.success(f"✅ 已成功導入全部 {len(all_contexts)} 篇不重複文章！")
-    #                     st.rerun()
-    #                 else:
-    #                     st.error("❌ 找不到可合併的欄位。")
 
     st.divider()
     st.subheader("📝 知識庫內容確認")
@@ -608,42 +698,84 @@ elif page == "正式資料庫管理":
     st.title("正式資料庫管理")
     st.info("這裡顯示的是 AI 目前在對話中使用的最終版本內容，可以在此修正錯誤並重新更新資料庫。")
 
-    if 'manual_context' in st.session_state and st.session_state['manual_context']:
-        col1, col2 = st.columns(2)
-        current_text = st.session_state['manual_context']
-        
-        with col1:
-            st.metric("📊 目前總字數", f"{len(current_text)} 字")
-        with col2:
-            db_status = "已啟用 ⚡ (摘要索引 + Rerank)" if 'vector_db' in st.session_state else "純文字模式 📄"
-            st.metric("狀態", db_status)
+    tab_work, tab_isms = st.tabs(["📋 工作規則庫", "🔒 ISMS 庫"])
 
-        st.divider()
-        st.subheader("📝 修正正式資料內容")
-        new_fixed_text = st.text_area(
-            "您可以直接在此修改文字，修正後請按下方更新按鈕：",
-            value=current_text,
-            height=600,
-            key="final_db_editor"
-        )
+    # ── 工作規則 ──
+    with tab_work:
+        if st.session_state.get('manual_context'):
+            current_text = st.session_state['manual_context']
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("📊 目前總字數", f"{len(current_text)} 字")
+            with col2:
+                db_status = "已啟用 ⚡ (摘要索引 + Rerank)" if st.session_state.get('vector_db') else "未建立 ❌"
+                st.metric("狀態", db_status)
 
-        if st.button("🔥 修正並重新上傳至正式資料庫 (更新 RAG)"):
-            if new_fixed_text:
-                with st.spinner("正在根據修正內容重新建立資料庫..."):
-                    st.session_state['manual_context'] = new_fixed_text
-                    new_docs = [Document(page_content=new_fixed_text, metadata={"page": "修正版本"})]
-                    st.session_state['vector_db'] = build_vector_store(new_docs, summarize_model=target_model)
-                    import os
-                    os.makedirs("faiss_index_storage", exist_ok=True)
-                    with open("faiss_index_storage/manual_context.txt", "w", encoding="utf-8") as f:
-                        f.write(new_fixed_text)
-                    st.success(f"✅ 修正完成，已重新建立摘要索引 RAG 資料庫（共 {len(new_fixed_text)} 字）！")
-                    st.balloons()
-                    st.rerun()
-            else:
-                st.error("內容不能為空！")
-    else:
-        st.warning("⚠️ 目前正式知識庫內沒有資料，請先前往「手冊解析與校對」頁面存入內容。")
+            st.divider()
+            st.subheader("📝 修正工作規則內容")
+            new_fixed_text = st.text_area(
+                "可直接在此修改文字，修正後請按下方更新按鈕：",
+                value=current_text,
+                height=600,
+                key="final_db_editor",
+            )
+            if st.button("🔥 修正並重新上傳（工作規則）", type="primary"):
+                if new_fixed_text:
+                    with st.spinner("正在重新建立工作規則資料庫..."):
+                        st.session_state['manual_context'] = new_fixed_text
+                        new_docs = [Document(page_content=new_fixed_text, metadata={"page": "修正版本"})]
+                        st.session_state['vector_db'] = build_vector_store(new_docs, summarize_model=target_model)
+                        os.makedirs("faiss_index_storage", exist_ok=True)
+                        with open("faiss_index_storage/manual_context.txt", "w", encoding="utf-8") as f:
+                            f.write(new_fixed_text)
+                        st.success(f"✅ 修正完成，共 {len(new_fixed_text)} 字！")
+                        st.balloons()
+                        st.rerun()
+                else:
+                    st.error("內容不能為空！")
+        else:
+            st.warning("⚠️ 工作規則庫尚無資料，請先至「手冊解析與校對」上傳文件。")
+
+    # ── ISMS ──
+    with tab_isms:
+        if st.session_state.get('isms_db'):
+            isms_sections = []
+            try:
+                import pickle
+                with open(f"{ISMS_INDEX_PATH}/sections.pkl", "rb") as f:
+                    isms_sections = pickle.load(f)
+            except Exception:
+                pass
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("📊 段落總數", f"{len(isms_sections)} 段")
+            with col2:
+                st.metric("狀態", "已啟用 ⚡ (摘要索引 + Rerank)")
+
+            st.divider()
+            st.subheader("📝 修正 ISMS 內容")
+            st.caption("將所有段落合併顯示，修改後重新建庫。段落間以 --- 分隔。")
+
+            combined_isms = "\n\n---\n\n".join([s.page_content for s in isms_sections])
+            new_isms_text = st.text_area(
+                "可直接在此修改文字，修正後請按下方更新按鈕：",
+                value=combined_isms,
+                height=600,
+                key="isms_db_editor",
+            )
+            if st.button("🔥 修正並重新上傳（ISMS）", type="primary"):
+                if new_isms_text:
+                    with st.spinner("正在重新建立 ISMS 資料庫..."):
+                        new_isms_docs = [Document(page_content=new_isms_text, metadata={"page": "修正版本"})]
+                        st.session_state['isms_db'] = build_isms_store(new_isms_docs)
+                        st.success(f"✅ ISMS 修正完成，共 {len(new_isms_text)} 字！")
+                        st.balloons()
+                        st.rerun()
+                else:
+                    st.error("內容不能為空！")
+        else:
+            st.warning("⚠️ ISMS 庫尚無資料，請先至「ISMS 文件管理」上傳文件。")
     
 # --- 頁面三：獨立對話頁面 ---
 elif page == "AI對話機器人(五方-工作規則)":
@@ -669,17 +801,20 @@ elif page == "AI對話機器人(五方-工作規則)":
             scored_docs = []
             history_so_far = st.session_state.messages[:-1]  # 不含當前這輪
 
-            # 獲取 RAG 背景資料（摘要索引檢索）
-            if st.session_state.get('vector_db'):
-                # Query Rewriting：把短問句結合歷史改寫成完整查詢，解決上下文斷鏈問題
+            # 獲取 RAG 背景資料（路由分庫檢索）
+            has_any_db = st.session_state.get('vector_db') or st.session_state.get('isms_db')
+            if has_any_db:
+                # Query Rewriting：把短問句結合歷史改寫成完整查詢
                 search_query = _rewrite_query(prompt, history_so_far, target_model)
                 if search_query != prompt:
                     st.caption(f"🔄 查詢改寫：{search_query}")
 
-                context, scored_docs = get_relevant_context(
+                route = _route_query(search_query)
+
+                context, scored_docs = get_routed_context(
                     search_query,
-                    st.session_state['vector_db'],
-                    current_k
+                    current_k,
+                    model_name=target_model,
                 )
 
                 # --- Debug 展開視窗 ---
@@ -699,7 +834,7 @@ elif page == "AI對話機器人(五方-工作規則)":
 
             # 無 RAG 庫：拒絕回答，避免 LLM 憑空捏造
             answer = ""
-            if not st.session_state.get('vector_db'):
+            if not has_any_db:
                 answer = "⚠️ 尚未建立知識庫，請先至「手冊解析與校對」頁面上傳文件並存入知識庫。"
                 st.markdown(answer, unsafe_allow_html=True)
             # Rerank 門檻攔截：知識庫無相關內容
@@ -709,9 +844,10 @@ elif page == "AI對話機器人(五方-工作規則)":
             else:
                 system_instruction = (
                     "你現在是一位專業的企業行政助手。\n"
-                    "你的唯一任務是根據使用者提供的【手冊內容】回答問題。\n\n"
+                    "你的唯一任務是根據以下【手冊內容】回答問題，並記住本次對話的所有歷史紀錄。\n\n"
+                    f"【手冊內容】：\n{context}\n\n"
                     "【強制規則】：\n"
-                    "1. 只能從下方【手冊內容】中尋找答案，絕對不可使用手冊以外的任何知識。\n"
+                    "1. 只能從上方【手冊內容】中尋找答案，絕對不可使用手冊以外的任何知識。\n"
                     "2. 必須完全使用繁體中文（台灣習慣用語）回答。\n"
                     "3. 手冊中若找不到答案，請明確說「手冊中未提及此項目」，不要推測或編造。\n"
                     "4. 回答結尾必須附上【原文依據】，直接引用手冊中的相關句子。\n"
@@ -720,15 +856,15 @@ elif page == "AI對話機器人(五方-工作規則)":
                     "例如：手冊列舉的解僱事由不包含某行為，就必須回答「手冊未列此情況，無法適用」，不得猜測該行為是否符合某條款。\n"
                     "7. 【禁止擴大解釋】：若條文明確限定條件（如『連休3日以上』），不得將該規定套用到條件以外的情況。\n"
                     "8. 遇到打招呼，請親切回應，無需引用手冊。\n"
-                    "9. 遇到無意義亂碼，請禮貌說明並引導詢問手冊相關問題。"
+                    "9. 遇到無意義亂碼，請禮貌說明並引導詢問手冊相關問題。\n"
+                    "10. 若使用者的問題參照了前幾輪對話（如『那這個呢』、『剛才說的』），請結合對話歷史理解後再回答。"
                 )
 
-                full_prompt = f"【手冊內容】：\n{context}\n\n當前問題：{prompt}"
-                #歷史僅保留最近 3 輪（6 條），避免幻覺累積與 context 超長
+                # RAG 內容已放入 system，歷史訊息保持純對話，LLM 才能真正記憶上下文
                 chat_messages = [{'role': 'system', 'content': system_instruction}]
-                for msg in history_so_far[-6:]:
+                for msg in history_so_far[-6:]:  # 最近 3 輪
                     chat_messages.append({'role': msg['role'], 'content': msg['content']})
-                chat_messages.append({'role': 'user', 'content': full_prompt})
+                chat_messages.append({'role': 'user', 'content': prompt})
 
                 placeholder = st.empty()
                 answer = ""
@@ -1052,3 +1188,69 @@ elif page == "分塊評估":
             file_name="chunk_eval_results.csv",
             mime="text/csv",
         )
+
+# --- ISMS 文件管理頁面 ---
+elif page == "ISMS 文件管理":
+    st.title("🔒 ISMS 文件管理")
+
+    # 現有庫狀態
+    if st.session_state.get('isms_db'):
+        st.success("✅ ISMS 知識庫已載入，AI 對話可使用。")
+    else:
+        st.warning("⚠️ ISMS 知識庫尚未建立，請上傳文件並建庫。")
+
+    st.divider()
+    st.subheader("📁 批次上傳 ISMS PDF（可一次選多份）")
+
+    uploaded_files = st.file_uploader(
+        "選擇 ISMS PDF 文件（可複選）",
+        type="pdf",
+        accept_multiple_files=True,
+        key="isms_uploader",
+    )
+
+    if uploaded_files:
+        st.info(f"已選取 {len(uploaded_files)} 份文件：" + "、".join([f.name for f in uploaded_files]))
+
+        if st.button("🔍 解析並建立 ISMS 知識庫", type="primary"):
+            all_docs = []
+            progress = st.progress(0, text="開始解析...")
+            for idx, uploaded_file in enumerate(uploaded_files):
+                progress.progress((idx) / len(uploaded_files), text=f"解析中：{uploaded_file.name}")
+                try:
+                    reader = PdfReader(uploaded_file)
+                    for i, page in enumerate(reader.pages):
+                        t = page.extract_text()
+                        if t and t.strip():
+                            all_docs.append(Document(
+                                page_content=clean_duplicated_text(t.strip()),
+                                metadata={"page": i + 1, "source": uploaded_file.name},
+                            ))
+                except Exception as e:
+                    st.error(f"❌ {uploaded_file.name} 解析失敗：{e}")
+
+            progress.progress(1.0, text="解析完成，開始建庫...")
+
+            if all_docs:
+                st.session_state['isms_db'] = build_isms_store(all_docs)
+                st.balloons()
+            else:
+                st.error("❌ 所有文件均無法解析，請確認 PDF 格式是否正確。")
+
+    st.divider()
+    st.subheader("🗂️ 目前知識庫資訊")
+    col1, col2 = st.columns(2)
+    with col1:
+        isms_status = "已建立 ✅" if st.session_state.get('isms_db') else "未建立 ❌"
+        st.metric("ISMS 庫狀態", isms_status)
+    with col2:
+        work_status = "已建立 ✅" if st.session_state.get('vector_db') else "未建立 ❌"
+        st.metric("工作規則庫狀態", work_status)
+
+    if st.session_state.get('isms_db') and st.button("🗑️ 清除 ISMS 知識庫"):
+        import shutil
+        del st.session_state['isms_db']
+        if os.path.exists(ISMS_INDEX_PATH):
+            shutil.rmtree(ISMS_INDEX_PATH)
+        st.success("ISMS 知識庫已清除。")
+        st.rerun()
