@@ -1,0 +1,8 @@
+
+
+
+docker build --no-cache -t my-rag-app .
+
+docker rm -f rag-service (刪掉原本)
+
+docker run -d --restart unless-stopped -p 8501:8501 --add-host=host.docker.internal:host-gateway --name rag-service my-rag-app
