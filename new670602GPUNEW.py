@@ -75,7 +75,7 @@ with st.sidebar:
     all_menu_options = ["AI對話機器人(五方-工作規則+ISMS)", "ISMS 文件管理", "手冊解析與校對", "正式資料庫管理"]
 
 # UI 只顯示你想要的
-    visible_options = ["AI對話機器人(五方-工作規則+ISMS)"]
+    visible_options = ["AI對話機器人(五方-工作規則+ISMS)", "ISMS 文件管理", "手冊解析與校對", "正式資料庫管理"]
 
     
     page_selection = st.radio("選單", options=visible_options, index=0)
@@ -767,6 +767,7 @@ elif page == "正式資料庫管理":
             st.caption("將所有段落合併顯示，修改後重新建庫。段落間以 --- 分隔。")
 
             combined_isms = "\n\n---\n\n".join([s.page_content for s in isms_sections])
+            combined_isms = re.sub(r'([\u4e00-\u9fff])\s+([\u4e00-\u9fff])', r'\1\2', combined_isms)#減少空白間格
             new_isms_text = st.text_area(
                 "可直接在此修改文字，修正後請按下方更新按鈕：",
                 value=combined_isms,
@@ -776,7 +777,7 @@ elif page == "正式資料庫管理":
             if st.button("🔥 修正並重新上傳（ISMS）", type="primary"):
                 if new_isms_text:
                     with st.spinner("正在重新建立 ISMS 資料庫..."):
-                        new_isms_docs = [Document(page_content=new_isms_text, metadata={"page": "修正版本"})]
+                        new_isms_docs = [Document(page_content=re.sub(r'([\u4e00-\u9fff])\s+([\u4e00-\u9fff])', r'\1\2', new_isms_text.strip()),metadata={"page": "修正版本"})]#減少空白間格
                         st.session_state['isms_db'] = build_isms_store(new_isms_docs)
                         st.success(f"✅ ISMS 修正完成，共 {len(new_isms_text)} 字！")
                         st.balloons()
