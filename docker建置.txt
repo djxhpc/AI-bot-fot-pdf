@@ -1,8 +1,13 @@
+pip freeze > requirements.txt
+pywin32==311(刪掉)
 
-
+docker builder prune -f (清緩存)
 
 docker build --no-cache -t my-rag-app .
 
 docker rm -f rag-service (刪掉原本)
 
 docker run -d --restart unless-stopped -p 8501:8501 --add-host=host.docker.internal:host-gateway --name rag-service my-rag-app
+
+
+docker run -d --restart unless-stopped -p 8501:8501 --add-host=host.docker.internal:host-gateway -e OLLAMA_HOST=http://host.docker.internal:11434 -v "${PWD}/faiss_index_storage:/app/faiss_index_storage" -v "${PWD}/models:/app/models" -v "C:\Users\WF_114.WFUSION\.cache\huggingface:/root/.cache/huggingface" --name rag-service my-rag-app
