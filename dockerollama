@@ -1,0 +1,46 @@
+OLLAMA_KEEP_ALIVE=10m        # 模型常駐記憶體，避免每次重新載入
+OLLAMA_NUM_PARALLEL=1        # 單一請求，確保 GPU 資源不被分散
+OLLAMA_FLASH_ATTENTION=1     # 啟用 Flash Attention（支援的話可省 30-40% 記憶體）
+
+
+  看了你的程式碼，找到幾個主要瓶頸：
+
+主要慢點分析
+num_ctx: 16384 — 最大元兇，佔用大量 VRAM，每次推理都要分配巨大 KV Cache
+num_predict: 2000 — 上限太高，即使答案短也會預留運算空間
+Query Rewriting — 每次有代詞時多跑一次 LLM call
+Reranker — CrossEncoder 對每個候選段落都要推理一次
+建議修改（由快到慢）
+第一步：調整 Ollama 推理參數（效果最大）
+
+Edited
+new670603.py
++7
+-1
+第二步：同步修改非串流版的 RAG（批次測試用）
+
+Edited
+new670603.py
++1
+-1
+第三步：Query Rewriting 也要降低
+
+Edited
+new670603.py
++1
+-1
+其他建議（不動程式碼）
+Ollama 環境設定（Docker 層面）
+
+在 Docker 啟動 Ollama 時加這些環境變數：
+
+OLLAMA_KEEP_ALIVE=10m        # 模型常駐記憶體，避免每次重新載入
+OLLAMA_NUM_PARALLEL=1        # 單一請求，確保 GPU 資源不被分散
+OLLAMA_FLASH_ATTENTION=1     # 啟用 Flash Attention（支援的話可省 30-40% 記憶體）
+為什麼這樣改有效？
+
+參數	原本	修改後	預期加速
+num_ctx	16384	4096	KV Cache 縮小 4 倍，TTFT 大幅下降
+num_predict	2000	800	最長輸出縮短，避免尾端等待
+num_gpu: 99	未指定	全層 GPU	排除 CPU offload 拖慢
+num_ctx=4096 對你的場景（RAG 取 10 段 × 200 字 + prompt）應該綽綽有餘。如果遇到截斷可以再調到 6144。
