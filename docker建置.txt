@@ -1,8 +1,9 @@
 pip freeze > requirements.txt
 pywin32==311(刪掉)
+(requirements.txt的torch相關要砍掉)
 
 docker builder prune -f (清緩存)
-(requirements.txt的torch相關要砍掉)
+
 docker build --no-cache -t my-rag-app .
 
 docker rm -f rag-service (刪掉原本)
