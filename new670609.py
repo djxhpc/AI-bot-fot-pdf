@@ -101,15 +101,15 @@ with st.sidebar:
     #     target_model = st.text_input("手動輸入模型", value="qwen2.5")
     # target_model = "ycchen/breeze-7b-instruct-v1_0:latest"
     # target_model = "kenneth85/llama-3-taiwan:8b-instruct-dpo-q5_K_M"
-    target_model = "kenneth85/llama-3-taiwan:8b-instruct-dpo-q3_K_M"
-    # target_model = "kenneth85/llama-3-taiwan:8b-instruct-dpo-q6_K"
+    # target_model = "kenneth85/llama-3-taiwan:8b-instruct-dpo-q3_K_M"
+    target_model = "kenneth85/llama-3-taiwan:8b-instruct-dpo-q6_K"
 
     # # st.subheader("⚙️ 檢索與重排配置")
     # retrieval_k = st.slider("最終提供給 AI 的片段數量 (K)", min_value=1, max_value=30, value=15, help="混合搜尋後經由 Rerank 篩選出的最終菁英片段數量。")
     # st.session_state['dynamic_k'] = retrieval_k
     # score_threshold = st.slider("Rerank 分數門檻", min_value=0.0, max_value=1.0, value=0.1, step=0.05, help="低於此分數的段落視為無相關內容")
     # st.session_state['score_threshold'] = score_threshold
-    st.session_state['dynamic_k'] = 10
+    st.session_state['dynamic_k'] = 5
     st.session_state['score_threshold'] = 0.05
 
 
@@ -216,7 +216,7 @@ def _generate_summary_for_section(section_text: str, model_name: str) -> str:
         resp = chat(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.0, "num_predict": 2000},
+            options={"temperature": 0.0, "num_predict": 250},#2000
         )
         return resp.message.content.strip()
     except Exception:
@@ -252,7 +252,7 @@ def _rewrite_query(query: str, history: list, model_name: str) -> str:
         resp = chat(
             model=model_name,
             messages=[{"role": "user", "content": rewrite_prompt}],
-            options={"temperature": 0.0, "num_predict": 100, "num_ctx": 2048, "num_gpu": 99},
+            options={"temperature": 0.0, "num_predict": 100},
         )
         return resp.message.content.strip() or query
     except Exception:
@@ -470,7 +470,7 @@ def get_relevant_context(query, hybrid_db, k_value, model_name: str = ""):
     # candidate_k = max(k_value * 2, 15)
     candidate_k = max(k_value * 2, 10)
     # candidate_k = max(k_value * 3, 20)
-
+    
     # HyDE：短問句（15字以內）先生成假答案擴展搜尋語意
     search_query = _hyde_expand(query, model_name) if model_name and len(query) <= 15 else query
 
@@ -582,7 +582,7 @@ def get_rag_answer(question: str, model_name: str, k: int) -> tuple[str, str]:
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": full_prompt},
             ],
-            options={"temperature": 0.0, "num_predict": 800, "num_ctx": 4096, "num_gpu": 99},
+            options={"temperature": 0.0, "num_predict": 2000},
         )
         return resp.message.content.strip(), context_preview
     except Exception as e:
@@ -836,9 +836,14 @@ elif page == "AI對話機器人(五方-工作規則+ISMS)":
             scored_docs = []
             history_so_far = st.session_state.messages[:-1]  # 不含當前這輪
 
+            # 💡 【新增】打招呼快取短路機制
+            _GREETINGS = ["安", "安安", "你好", "您好", "哈囉", "hello", "hi", "嗨", "早安", "午安", "晚安"]
+            # 清除前後空白並轉小寫判定
+            is_greeting = prompt.strip().lower() in _GREETINGS
+
             # 獲取 RAG 背景資料（路由分庫檢索）
             has_any_db = st.session_state.get('vector_db') or st.session_state.get('isms_db')
-            if has_any_db:
+            if has_any_db and not is_greeting:
                 # Query Rewriting：把短問句結合歷史改寫成完整查詢
                 search_query = _rewrite_query(prompt, history_so_far, target_model)
                 if search_query != prompt:
@@ -867,7 +872,9 @@ elif page == "AI對話機器人(五方-工作規則+ISMS)":
                             icon   = "✅" if passed else "❌"
                             st.write(f"{icon} 名次 {i+1} | 分數 `{score:.4f}` | 📄 第 {page_num} 頁")
                             st.code(d.page_content[:300])
-
+            else:
+            # 如果是打招呼，主動將 context 設為空字串，跳過 RAG 灌水
+                context = ""
 
             # 無 RAG 庫：拒絕回答，避免 LLM 憑空捏造
             answer = ""
@@ -899,7 +906,7 @@ elif page == "AI對話機器人(五方-工作規則+ISMS)":
 
                 # RAG 內容已放入 system，歷史訊息保持純對話，LLM 才能真正記憶上下文
                 chat_messages = [{'role': 'system', 'content': system_instruction}]
-                for msg in history_so_far[-3:]:  # 最近 3 輪
+                for msg in history_so_far[-2:]:  # 最近 3 輪
                     chat_messages.append({'role': msg['role'], 'content': msg['content']})
                 chat_messages.append({'role': 'user', 'content': prompt})
 
@@ -930,13 +937,7 @@ elif page == "AI對話機器人(五方-工作規則+ISMS)":
                         model=target_model,
                         messages=chat_messages,
                         stream=True,
-                        options={
-                            "temperature": 0.0,
-                            "num_predict": 800,   # 企業問答通常不需要 2000，800 已足夠
-                            "num_ctx": 4096,      # 從 16384 降到 4096，大幅節省 VRAM 與 KV Cache
-                            "num_gpu": 99,        # 確保所有層都在 GPU（Docker 掛本地 GPU 時有時預設偏低）
-                            "num_thread": 4,      # CPU 輔助執行緒，避免 bottleneck
-                        },
+                        options={"temperature": 0.0, "num_predict": 800,"num_ctx": 4096},
                     )
 
                     for chunk in response_stream:
@@ -944,7 +945,7 @@ elif page == "AI對話機器人(五方-工作規則+ISMS)":
                         if ttft_time is None:
                             ttft_time = time.time() - start_time
                             # 將 TTFT 印在命令列終端機 (Terminal) 方便觀察
-                            # print(f"⏱️ [效能監測] Time to First Token (TTFT): {ttft_time:.2f} 秒")
+                            print(f"⏱️ [效能監測] Time to First Token (TTFT): {ttft_time:.2f} 秒")
                         
                         answer += chunk.message.content
                         placeholder.markdown(answer)
